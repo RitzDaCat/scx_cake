@@ -154,7 +154,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 
     /* Direct dispatch if idle CPU found */
     if (is_idle) {
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, 0);
         __sync_fetch_and_add(&stats.nr_new_flow_dispatches, 1);
     }
 
@@ -192,7 +192,7 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
         __sync_fetch_and_add(&stats.nr_tier_dispatches[tier], 1);
 
     /* Use FIFO dispatch to shared DSQ */
-    scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+    scx_bpf_dsq_insert(p, SHARED_DSQ, quantum_ns, enq_flags);
 }
 
 /*

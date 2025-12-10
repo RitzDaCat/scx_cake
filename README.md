@@ -54,6 +54,7 @@ scx_cake/
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--quantum` | 4000 µs | Time slice for each task |
 | `--starvation-limit` | 100000 µs | Max time before forced preemption |
 | `--verbose` | false | Print statistics periodically |
 | `--interval` | 1 sec | Stats print interval |
@@ -64,7 +65,6 @@ These are parsed but don't affect scheduling behavior:
 
 | Option | Default | Status |
 |--------|---------|--------|
-| `--quantum` | 4000 µs | ❌ Not used |
 | `--sparse-threshold` | 100‰ | ❌ Not used |
 | `--new-flow-bonus` | 8000 µs | ❌ Not used |
 
