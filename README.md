@@ -6,7 +6,7 @@ A sched_ext scheduler inspired by the CAKE (Common Applications Kept Enhanced) b
 
 ## Performance
 
-Early testing shows **excellent 1% lows** in games like Arc Raiders compared to default schedulers.
+Early testing showed good framerate and 1% lows in games like Arc Raiders.
 
 ## Architecture Overview
 
