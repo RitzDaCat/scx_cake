@@ -66,6 +66,24 @@ These are parsed but don't affect scheduling behavior:
 |--------|---------|--------|
 | `--new-flow-bonus` | 8000 µs | ❌ Not used |
 
+## Tuning Guide
+
+### Case Study: Arc Raiders
+
+Testing with `--quantum 2000` showed how `--sparse-threshold` impacts priority classification:
+
+| Threshold | Cutoff (2000 quantum) | Gaming % | Best Effort % | Observations |
+|-----------|-----------------------|----------|---------------|--------------|
+| **1‰** | 2 µs | 27% | 73% | Ultra-selective. Only fastest tasks get priority. High churn. |
+| **5‰** | 10 µs | 47% | 47% | Balanced split but very high churn (13K+ events). |
+| **10‰** | 20 µs | 50% | 50% | **Balanced & Stable**. Good split with low churn. |
+| **50‰** | 100 µs | 95% | 5% | Lenient. Most game tasks get priority. |
+| **150‰** | 300 µs | 97% | 3% | Very lenient. Almost everything is prioritized. |
+
+**Recommendation:**
+- Use **10‰** for strict priority (prioritizing only the most latency-critical threads).
+- Use **50‰+** if you want to ensure the entire game process gets priority over background tasks.
+
 ## Requirements
 
 - **Kernel**: Linux 6.12+ with `CONFIG_SCHED_CLASS_EXT=y`
