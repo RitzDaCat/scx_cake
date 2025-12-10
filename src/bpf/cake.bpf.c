@@ -7,10 +7,9 @@
  * interactive workloads.
  *
  * Key concepts from CAKE adapted here:
- * - New-flow vs old-flow: Waking tasks get priority over running/preempted tasks
  * - Sparse flow detection: Low-CPU tasks (like gaming) get latency priority
- * - Deficit scheduling: Fair share based on runtime accounting
- * - Priority tiers: Voice > Gaming > Best Effort > Background
+ * - Direct dispatch: Waking tasks on idle CPUs run immediately
+ * - Two-tier DSQ: Gaming/sparse tasks dispatched before normal tasks
  */
 
 #include <scx/common.bpf.h>
@@ -37,10 +36,15 @@ UEI_DEFINE(uei);
 static u64 vtime_now;
 
 /*
- * We use a single shared DSQ for simplicity, similar to scx_simple.
- * This ensures the scheduler works before adding complexity.
+ * Two dispatch queues:
+ * - GAMING_DSQ: for sparse/interactive tasks (served first)
+ * - NORMAL_DSQ: for normal/bulk tasks
  */
-#define SHARED_DSQ 0
+#define GAMING_DSQ 0
+#define NORMAL_DSQ 1
+
+/* Sparse score threshold for Gaming tier (0-100) */
+#define SPARSE_PROMOTE_THRESHOLD 70
 
 /*
  * Per-task context map
@@ -83,6 +87,14 @@ static struct cake_task_ctx *get_task_ctx(struct task_struct *p)
 }
 
 /*
+ * Check if task is sparse (interactive/gaming)
+ */
+static bool is_sparse(struct cake_task_ctx *tctx)
+{
+    return tctx->sparse_score >= SPARSE_PROMOTE_THRESHOLD;
+}
+
+/*
  * Classify task tier based on nice value and sparse score
  */
 static u8 classify_tier(struct task_struct *p, struct cake_task_ctx *tctx)
@@ -90,7 +102,7 @@ static u8 classify_tier(struct task_struct *p, struct cake_task_ctx *tctx)
     s32 nice = p->static_prio - 120; /* Convert priority to nice value */
 
     /* Sparse flows (interactive) get boosted to Gaming tier */
-    if (tctx->sparse_score >= 70)
+    if (is_sparse(tctx))
         return CAKE_TIER_GAMING;
 
     /* Use nice value for tier assignment */
@@ -117,7 +129,7 @@ static void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
         if (score < 100) {
             score += 5;
             if (score > 100) score = 100;
-            if (score >= 70 && tctx->sparse_score < 70)
+            if (score >= SPARSE_PROMOTE_THRESHOLD && tctx->sparse_score < SPARSE_PROMOTE_THRESHOLD)
                 __sync_fetch_and_add(&stats.nr_sparse_promotions, 1);
         }
     } else {
@@ -125,7 +137,7 @@ static void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
         if (score > 0) {
             if (score >= 5) score -= 5;
             else score = 0;
-            if (score < 70 && tctx->sparse_score >= 70)
+            if (score < SPARSE_PROMOTE_THRESHOLD && tctx->sparse_score >= SPARSE_PROMOTE_THRESHOLD)
                 __sync_fetch_and_add(&stats.nr_sparse_demotions, 1);
         }
     }
@@ -152,7 +164,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     /* Try to find an idle CPU, prefer same LLC */
     cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-    /* Direct dispatch if idle CPU found */
+    /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
     if (is_idle) {
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, 0);
         __sync_fetch_and_add(&stats.nr_new_flow_dispatches, 1);
@@ -162,17 +174,18 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 }
 
 /*
- * Enqueue task to the scheduler
+ * Enqueue task to the appropriate DSQ based on sparse detection
  */
 void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 {
     struct cake_task_ctx *tctx;
     u8 tier;
+    u64 dsq_id;
 
     tctx = get_task_ctx(p);
     if (!tctx) {
-        /* Fallback: dispatch to shared DSQ */
-        scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+        /* Fallback: dispatch to normal DSQ */
+        scx_bpf_dsq_insert(p, NORMAL_DSQ, quantum_ns, enq_flags);
         return;
     }
 
@@ -191,16 +204,33 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     if (tier < CAKE_TIER_MAX)
         __sync_fetch_and_add(&stats.nr_tier_dispatches[tier], 1);
 
-    /* Use FIFO dispatch to shared DSQ */
-    scx_bpf_dsq_insert(p, SHARED_DSQ, quantum_ns, enq_flags);
+    /*
+     * Route to DSQ based on sparse detection:
+     * - Sparse tasks (score >= 70) -> GAMING_DSQ (priority)
+     * - Normal tasks -> NORMAL_DSQ
+     */
+    if (is_sparse(tctx)) {
+        dsq_id = GAMING_DSQ;
+    } else {
+        dsq_id = NORMAL_DSQ;
+    }
+
+    scx_bpf_dsq_insert(p, dsq_id, quantum_ns, enq_flags);
 }
 
 /*
  * Dispatch tasks to run on this CPU
+ * 
+ * Gaming DSQ is served FIRST, giving priority to sparse/interactive tasks
  */
 void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 {
-    scx_bpf_dsq_move_to_local(SHARED_DSQ);
+    /* First: serve gaming/sparse tasks (priority) */
+    if (scx_bpf_dsq_move_to_local(GAMING_DSQ))
+        return;
+
+    /* Second: serve normal tasks */
+    scx_bpf_dsq_move_to_local(NORMAL_DSQ);
 }
 
 /*
@@ -238,7 +268,7 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
     runtime = now - tctx->last_run_at;
     tctx->total_runtime += runtime;
 
-    /* Update sparse score */
+    /* Update sparse score - this determines Gaming vs Normal DSQ */
     update_sparse_score(tctx, runtime);
 
     /* Charge vtime based on runtime and weight */
@@ -286,8 +316,19 @@ void BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
  */
 s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
 {
-    /* Create a single shared DSQ (like scx_simple) */
-    return scx_bpf_create_dsq(SHARED_DSQ, -1);
+    s32 ret;
+
+    /* Create Gaming DSQ (priority) */
+    ret = scx_bpf_create_dsq(GAMING_DSQ, -1);
+    if (ret < 0)
+        return ret;
+
+    /* Create Normal DSQ */
+    ret = scx_bpf_create_dsq(NORMAL_DSQ, -1);
+    if (ret < 0)
+        return ret;
+
+    return 0;
 }
 
 /*

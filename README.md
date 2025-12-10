@@ -8,29 +8,27 @@ A simple sched_ext scheduler inspired by CAKE bufferbloat concepts. Currently im
 
 Early testing showed good framerate and 1% lows in games like Arc Raiders.
 
-## What It Actually Does (Current Version)
-
-This is a **simplified scheduler** focused on one key optimization:
+## What It Actually Does
 
 ### Direct Local Dispatch
 When a task wakes up and there's an idle CPU available, it runs **immediately** without going through any queue. This is the main source of latency improvement.
 
-### FIFO Queue
-All other tasks go to a single shared FIFO queue - simple and fair.
+### Sparse Flow Detection (NEW!)
+Tasks are classified based on runtime behavior:
+- **Sparse** (score ≥ 70): Short bursts → Gaming DSQ (priority)
+- **Normal** (score < 70): Long runtime → Normal DSQ
+
+Gaming DSQ is served **first** in dispatch, giving priority to interactive tasks.
 
 ### Starvation Protection  
 Tasks running too long get preempted (configurable via `--starvation-limit`).
 
 ## What's NOT Implemented Yet
 
-The following CAKE-inspired features are **tracked for statistics only** and don't affect scheduling:
+The following features are **tracked for statistics only** and don't affect scheduling:
 
-- ❌ Sparse flow detection (calculated but unused)
-- ❌ Priority tiers (classified but all go to same queue)
-- ❌ Quantum-based time slicing (uses kernel default)
-- ❌ Multi-DSQ new-flow/old-flow priority
-
-These features are planned for future versions.
+- ❌ New-flow bonus (calculated but unused)
+- ❌ Full 4-tier priority (only 2 tiers: Gaming vs Normal)
 
 ## Code Structure
 
@@ -55,6 +53,7 @@ scx_cake/
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--quantum` | 4000 µs | Time slice for each task |
+| `--sparse-threshold` | 100‰ | Runtime threshold for sparse detection (10% = tasks faster than this get Gaming priority) |
 | `--starvation-limit` | 100000 µs | Max time before forced preemption |
 | `--verbose` | false | Print statistics periodically |
 | `--interval` | 1 sec | Stats print interval |
@@ -65,7 +64,6 @@ These are parsed but don't affect scheduling behavior:
 
 | Option | Default | Status |
 |--------|---------|--------|
-| `--sparse-threshold` | 100‰ | ❌ Not used |
 | `--new-flow-bonus` | 8000 µs | ❌ Not used |
 
 ## Requirements
