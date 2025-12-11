@@ -46,12 +46,16 @@ struct Args {
 
     /// CPU usage threshold for sparse flow classification (permille, 0-1000)
     /// Lower values = more tasks classified as sparse
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 50)]
     sparse_threshold: u64,
 
     /// Maximum time before forcing preemption (microseconds)
     #[arg(long, default_value_t = 100000)]
     starvation: u64,
+
+    /// Input latency ceiling in microseconds - safety net preempts if input task waits longer
+    #[arg(long, default_value_t = 1000)]
+    input_latency: u64,
 
     /// Enable verbose debug output
     #[arg(long, short)]
@@ -88,6 +92,7 @@ impl<'a> Scheduler<'a> {
             rodata.new_flow_bonus_ns = args.new_flow_bonus * 1000;
             rodata.sparse_threshold = args.sparse_threshold;
             rodata.starvation_ns = args.starvation * 1000;
+            rodata.input_latency_ns = args.input_latency * 1000;
             rodata.debug = args.debug;
         }
 
@@ -112,6 +117,7 @@ impl<'a> Scheduler<'a> {
         info!("  New flow bonus:   {} µs", self.args.new_flow_bonus);
         info!("  Sparse threshold: {}‰", self.args.sparse_threshold);
         info!("  Starvation limit: {} µs", self.args.starvation);
+        info!("  Input latency:    {} µs", self.args.input_latency);
 
         // Main loop - print statistics
         while !shutdown.load(Ordering::Relaxed) {
@@ -166,6 +172,8 @@ impl<'a> Scheduler<'a> {
         }
         println!("Sparse flow: +{} promotions, -{} demotions",
                  stats.nr_sparse_promotions, stats.nr_sparse_demotions);
+        println!("Input: {} events tracked, {} preempts fired",
+                 stats.nr_input_events, stats.nr_input_preempts);
         println!("Wait time: avg {} µs, max {} µs",
                  avg_wait_us, stats.max_wait_ns / 1000);
     }

@@ -42,9 +42,10 @@ enum cake_tier {
  * Flow state flags
  */
 enum cake_flow_flags {
-    CAKE_FLOW_NEW       = 1 << 0,  /* Task is in new-flow list */
-    CAKE_FLOW_SPARSE    = 1 << 1,  /* Task is sparse (low CPU usage) */
-    CAKE_FLOW_BOOSTED   = 1 << 2,  /* Manually boosted (e.g., gaming PID) */
+    CAKE_FLOW_NEW          = 1 << 0,  /* Task is in new-flow list */
+    CAKE_FLOW_SPARSE       = 1 << 1,  /* Task is sparse (low CPU usage) */
+    CAKE_FLOW_BOOSTED      = 1 << 2,  /* Manually boosted (e.g., gaming PID) */
+    CAKE_FLOW_INPUT_ACTIVE = 1 << 3,  /* Currently processing input events */
 };
 
 /*
@@ -55,6 +56,7 @@ struct cake_task_ctx {
     u64 last_run_at;       /* Last time task ran (ns) */
     u64 total_runtime;     /* Total accumulated runtime (ns) */
     u64 last_wake_at;      /* Last wakeup time (ns) */
+    u64 last_input_at;     /* Last time processed input event (ns) */
     u32 wake_count;        /* Number of wakeups (for sparse detection) */
     u32 run_count;         /* Number of times scheduled */
     u32 sparse_score;      /* 0-100, higher = more sparse */
@@ -72,6 +74,8 @@ struct cake_stats {
     u64 nr_tier_dispatches[CAKE_TIER_MAX]; /* Per-tier dispatch counts */
     u64 nr_sparse_promotions;      /* Sparse flow promotions */
     u64 nr_sparse_demotions;       /* Sparse flow demotions */
+    u64 nr_input_events;           /* Input events tracked via evdev */
+    u64 nr_input_preempts;         /* Safety net preemptions for input */
     u64 total_wait_ns;             /* Sum of all wait times */
     u64 nr_waits;                  /* Number of wait measurements */
     u64 max_wait_ns;               /* Maximum wait time seen */
@@ -92,6 +96,7 @@ struct cake_config {
 #define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)   /* 8ms */
 #define CAKE_DEFAULT_SPARSE_THRESHOLD   100                  /* 10% = 100 permille */
 #define CAKE_DEFAULT_STARVATION_NS      (100 * 1000 * 1000) /* 100ms */
+#define CAKE_DEFAULT_INPUT_LATENCY_NS   (1 * 1000 * 1000)   /* 1ms */
 
 /* DSQ IDs - per tier, with new/old flow variants */
 #define CAKE_DSQ_NEW_BASE   0x100

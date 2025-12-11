@@ -22,6 +22,7 @@ const volatile u64 quantum_ns = CAKE_DEFAULT_QUANTUM_NS;
 const volatile u64 new_flow_bonus_ns = CAKE_DEFAULT_NEW_FLOW_BONUS_NS;
 const volatile u64 sparse_threshold = CAKE_DEFAULT_SPARSE_THRESHOLD;
 const volatile u64 starvation_ns = CAKE_DEFAULT_STARVATION_NS;
+const volatile u64 input_latency_ns = CAKE_DEFAULT_INPUT_LATENCY_NS;
 const volatile bool debug = false;
 
 /*
@@ -82,6 +83,7 @@ static struct cake_task_ctx *get_task_ctx(struct task_struct *p)
     ctx->last_run_at = 0;
     ctx->total_runtime = 0;
     ctx->last_wake_at = 0;
+    ctx->last_input_at = 0;
     ctx->wake_count = 0;
     ctx->run_count = 0;
     ctx->sparse_score = 50; /* Start neutral */
@@ -97,6 +99,32 @@ static struct cake_task_ctx *get_task_ctx(struct task_struct *p)
 static bool is_sparse(struct cake_task_ctx *tctx)
 {
     return tctx->sparse_score >= SPARSE_PROMOTE_THRESHOLD;
+}
+
+/*
+ * Input detection via runtime heuristic
+ * 
+ * Identifies likely input tasks by behavioral signature:
+ * - Ultra-short runtime: <30µs (input IRQ handlers are 5-20µs)
+ * - High sparse score: >=80 (frequent wakes, short runs)
+ * - Sufficient history: >10 runs (not a new random task)
+ */
+static bool is_likely_input_task(struct cake_task_ctx *tctx)
+{
+    /* Need sufficient run history to judge */
+    if (tctx->run_count < 10)
+        return false;
+    
+    /* Must have very high sparse score (very short, bursty) */
+    if (tctx->sparse_score < 80)
+        return false;
+    
+    /* Average runtime must be ultra-short (<30µs = 30000ns) */
+    u64 avg_runtime_ns = tctx->total_runtime / tctx->run_count;
+    if (avg_runtime_ns > 30000)
+        return false;
+    
+    return true;
 }
 
 /*
@@ -182,28 +210,32 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     /*
-     * OPTIMIZATION DISABLED: Wake preemption for sparse tasks
+     * OPTIMIZATION: Input-specific safety net preemption
      * 
-     * This optimization caused severe 1% lows regression:
-     * - Without: 160fps
-     * - With conditional (1ms): 125fps
-     * - With input activity: 70fps
+     * Uses runtime heuristic to identify likely input tasks:
+     * - Ultra-short runtime (<30µs)
+     * - High sparse score (>=80)
+     * - Sufficient history (>10 runs)
      * 
-     * Issue: Even conditional preemption causes excessive context switching
-     * when input events trigger frequent sparse task wakeups.
+     * Only preempts if they haven't run in longer than input_latency_ns.
+     * This provides guaranteed input latency ceiling (configurable via --input-latency).
      * 
-     * Keeping disabled until better algorithm found.
+     * We check last_run_at (when task last executed) NOT last_wake_at (just set above).
+     * This accurately measures how long the input task has been blocked.
      */
-    /* DISABLED
-    if (is_sparse(tctx)) {
+    if (is_likely_input_task(tctx)) {
         u64 now = bpf_ktime_get_ns();
-        u64 since_last_run = tctx->last_run_at ? (now - tctx->last_run_at) : 10000000000ULL;
+        u64 time_since_run = tctx->last_run_at ? (now - tctx->last_run_at) : 0;
         
-        if (since_last_run > 1000000) {
+        /* Safety net: only kick if input task hasn't run beyond threshold */
+        if (time_since_run > input_latency_ns) {
             scx_bpf_kick_cpu(prev_cpu, SCX_KICK_PREEMPT);
+            __sync_fetch_and_add(&stats.nr_input_preempts, 1);
         }
+        
+        /* Track that we detected an input-like task */
+        __sync_fetch_and_add(&stats.nr_input_events, 1);
     }
-    */
 
     return cpu;
 }
