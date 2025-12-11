@@ -37,7 +37,7 @@ use bpf_skel::*;
 #[command(author, version, about)]
 struct Args {
     /// Base scheduling quantum in microseconds
-    #[arg(long, default_value_t = 4000)]
+    #[arg(long, default_value_t = 2000)]
     quantum: u64,
 
     /// Extra time bonus for new flows in microseconds
@@ -46,7 +46,7 @@ struct Args {
 
     /// CPU usage threshold for sparse flow classification (permille, 0-1000)
     /// Lower values = more tasks classified as sparse
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 10)]
     sparse_threshold: u64,
 
     /// Maximum time before forcing preemption (microseconds)

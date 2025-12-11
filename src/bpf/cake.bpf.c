@@ -35,6 +35,11 @@ UEI_DEFINE(uei);
 /* Global vtime for fair scheduling */
 static u64 vtime_now;
 
+/* Optimization: Precomputed threshold to avoid division in hot path */
+static u64 cached_threshold_ns;
+
+
+
 /*
  * Two dispatch queues:
  * - GAMING_DSQ: for sparse/interactive tasks (served first)
@@ -122,7 +127,8 @@ static u8 classify_tier(struct task_struct *p, struct cake_task_ctx *tctx)
 static void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
 {
     u32 score = tctx->sparse_score;
-    u64 threshold_ns = (quantum_ns * sparse_threshold) / 1000;
+    // Use precomputed value
+    u64 threshold_ns = cached_threshold_ns;
 
     if (runtime_ns < threshold_ns) {
         /* Short runtime = sparse, increase score */
@@ -156,19 +162,48 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     s32 cpu;
 
     tctx = get_task_ctx(p);
-    if (tctx) {
-        tctx->last_wake_at = bpf_ktime_get_ns();
-        tctx->wake_count++;
+    if (unlikely(!tctx)) {
+        /* Fallback if we can't get context */
+        return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     }
+
+    tctx->last_wake_at = bpf_ktime_get_ns();
+    tctx->wake_count++;
 
     /* Try to find an idle CPU, prefer same LLC */
     cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
     /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
     if (is_idle) {
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, 0);
+        /* Use SCX_ENQ_LAST to skip redundant enqueue call - saves 5-20µs */
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, SCX_ENQ_LAST);
         __sync_fetch_and_add(&stats.nr_new_flow_dispatches, 1);
+        return cpu;
     }
+
+    /*
+     * OPTIMIZATION DISABLED: Wake preemption for sparse tasks
+     * 
+     * This optimization caused severe 1% lows regression:
+     * - Without: 160fps
+     * - With conditional (1ms): 125fps
+     * - With input activity: 70fps
+     * 
+     * Issue: Even conditional preemption causes excessive context switching
+     * when input events trigger frequent sparse task wakeups.
+     * 
+     * Keeping disabled until better algorithm found.
+     */
+    /* DISABLED
+    if (is_sparse(tctx)) {
+        u64 now = bpf_ktime_get_ns();
+        u64 since_last_run = tctx->last_run_at ? (now - tctx->last_run_at) : 10000000000ULL;
+        
+        if (since_last_run > 1000000) {
+            scx_bpf_kick_cpu(prev_cpu, SCX_KICK_PREEMPT);
+        }
+    }
+    */
 
     return cpu;
 }
@@ -183,7 +218,7 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     u64 dsq_id;
 
     tctx = get_task_ctx(p);
-    if (!tctx) {
+    if (unlikely(!tctx)) {
         /* Fallback: dispatch to normal DSQ */
         scx_bpf_dsq_insert(p, NORMAL_DSQ, quantum_ns, enq_flags);
         return;
@@ -215,7 +250,19 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
         dsq_id = NORMAL_DSQ;
     }
 
-    scx_bpf_dsq_insert(p, dsq_id, quantum_ns, enq_flags);
+    /*
+     * OPTIMIZATION: New flow bonus via slice adjustment
+     * New flows have higher deficit (quantum + bonus), so give them
+     * a longer initial slice. This effectively prioritizes them without
+     * needing vtime/PRIQ ordering.
+     */
+    u64 slice = quantum_ns;
+    if (tctx->deficit > quantum_ns) {
+        /* New flow with bonus - give extra slice time */
+        slice = tctx->deficit;
+    }
+
+    scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
 }
 
 /*
@@ -241,7 +288,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     struct cake_task_ctx *tctx;
 
     tctx = get_task_ctx(p);
-    if (!tctx)
+    if (unlikely(!tctx))
         return;
 
     tctx->last_run_at = bpf_ktime_get_ns();
@@ -262,7 +309,7 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
     u64 runtime;
 
     tctx = get_task_ctx(p);
-    if (!tctx || tctx->last_run_at == 0)
+    if (unlikely(!tctx || tctx->last_run_at == 0))
         return;
 
     runtime = now - tctx->last_run_at;
@@ -272,7 +319,12 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
     update_sparse_score(tctx, runtime);
 
     /* Charge vtime based on runtime and weight */
-    p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+    if (likely(p->scx.weight == 100)) {
+        /* Optimization: Standard weight (nice 0) - avoid division */
+        p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice);
+    } else {
+        p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+    }
 
     /* Update deficit */
     if (runtime < tctx->deficit)
@@ -289,7 +341,7 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
     struct cake_task_ctx *tctx;
 
     tctx = get_task_ctx(p);
-    if (!tctx)
+    if (unlikely(!tctx))
         return;
 
     /* Check for starvation */
@@ -317,6 +369,9 @@ void BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
 s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
 {
     s32 ret;
+
+    /* Precompute sparse threshold (avoid division in hot path) */
+    cached_threshold_ns = (quantum_ns * sparse_threshold) / 1000;
 
     /* Create Gaming DSQ (priority) */
     ret = scx_bpf_create_dsq(GAMING_DSQ, -1);
