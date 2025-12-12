@@ -145,8 +145,8 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn print_stats(&self) {
-        let bss = match &self.skel.maps.bss_data {
+    fn print_stats(&mut self) {
+        let bss = match &mut self.skel.maps.bss_data {
             Some(bss) => bss,
             None => return,
         };
@@ -167,15 +167,29 @@ impl<'a> Scheduler<'a> {
 
         println!("\n=== scx_cake Statistics ===");
         println!("Dispatches: {} total ({:.1}% new-flow)", total_dispatches, new_pct);
+        println!("  {:12} {:>10}  {:>12}", "Tier", "Dispatches", "Max Wait");
         for (i, name) in stats::TIER_NAMES.iter().enumerate() {
-            println!("  {:12} {}", format!("{}:", name), stats.nr_tier_dispatches[i]);
+            let max_wait_us = stats.max_wait_ns_tier[i] / 1000;
+            println!("  {:12} {:>10}  {:>10} µs", name, stats.nr_tier_dispatches[i], max_wait_us);
         }
         println!("Sparse flow: +{} promotions, -{} demotions",
                  stats.nr_sparse_promotions, stats.nr_sparse_demotions);
         println!("Input: {} events tracked, {} preempts fired",
                  stats.nr_input_events, stats.nr_input_preempts);
-        println!("Wait time: avg {} µs, max {} µs",
+        println!("Wait time: avg {} µs, max {} µs (overall)",
                  avg_wait_us, stats.max_wait_ns / 1000);
+
+        // Reset wait time stats for per-interval measurement
+        let stats_mut = &mut bss.stats;
+        stats_mut.total_wait_ns = 0;
+        stats_mut.nr_waits = 0;
+        stats_mut.max_wait_ns = 0;
+        // Reset per-tier wait stats
+        for i in 0..4 {
+            stats_mut.total_wait_ns_tier[i] = 0;
+            stats_mut.nr_waits_tier[i] = 0;
+            stats_mut.max_wait_ns_tier[i] = 0;
+        }
     }
 }
 

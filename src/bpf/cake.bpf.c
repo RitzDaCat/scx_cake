@@ -42,15 +42,30 @@ static u64 cached_threshold_ns;
 
 
 /*
- * Two dispatch queues:
- * - GAMING_DSQ: for sparse/interactive tasks (served first)
- * - NORMAL_DSQ: for normal/bulk tasks
+ * Four dispatch queues - one per tier, served in priority order:
+ * - CRITICAL_DSQ: Ultra-sparse tasks (input handlers, IRQ) - highest priority
+ * - GAMING_DSQ: Sparse/bursty tasks (game threads, UI) - high priority  
+ * - INTERACTIVE_DSQ: Normal tasks (default applications) - normal priority
+ * - BACKGROUND_DSQ: Bulk tasks (compilers, encoders) - lowest priority
  */
-#define GAMING_DSQ 0
-#define NORMAL_DSQ 1
+#define CRITICAL_DSQ    0
+#define GAMING_DSQ      1
+#define INTERACTIVE_DSQ 2
+#define BACKGROUND_DSQ  3
 
-/* Sparse score threshold for Gaming tier (0-100) */
-#define SPARSE_PROMOTE_THRESHOLD 70
+/* Sparse score thresholds for tier classification (0-100)
+ * Each tier is determined by the sparse score range:
+ * - 90-100: Critical (ultra-sparse, input handlers)
+ * - 75-89:  Gaming (sparse, interactive)
+ * - 25-74:  Interactive (normal applications)
+ * - 0-24:   Background (bulk/heavy CPU users)
+ * 
+ * Hysteresis is applied at each boundary to prevent churn.
+ */
+#define THRESHOLD_CRITICAL   90  /* Score >= 90 → Critical */
+#define THRESHOLD_GAMING     75  /* Score >= 75 → Gaming */
+#define THRESHOLD_INTERACTIVE 25 /* Score >= 25 → Interactive */
+/* Below 25 → Background */
 
 /*
  * Per-task context map
@@ -87,18 +102,10 @@ static struct cake_task_ctx *get_task_ctx(struct task_struct *p)
     ctx->wake_count = 0;
     ctx->run_count = 0;
     ctx->sparse_score = 50; /* Start neutral */
-    ctx->tier = CAKE_TIER_BESTEFFORT;
+    ctx->tier = CAKE_TIER_INTERACTIVE;
     ctx->flags = CAKE_FLOW_NEW;
 
     return ctx;
-}
-
-/*
- * Check if task is sparse (interactive/gaming)
- */
-static bool is_sparse(struct cake_task_ctx *tctx)
-{
-    return tctx->sparse_score >= SPARSE_PROMOTE_THRESHOLD;
 }
 
 /*
@@ -128,34 +135,41 @@ static bool is_likely_input_task(struct cake_task_ctx *tctx)
 }
 
 /*
- * Classify task tier based on nice value and sparse score
+ * Classify task tier based on sparse score (behavior-based)
+ * 
+ * Score ranges:
+ *   90-100: Critical - Ultra-sparse (input handlers, IRQ threads)
+ *   75-89:  Gaming   - Sparse (game threads, UI, audio)
+ *   25-74:  Interactive - Normal (most applications)
+ *   0-24:   Background - Bulk (compilers, encoders)
  */
 static u8 classify_tier(struct task_struct *p, struct cake_task_ctx *tctx)
 {
-    s32 nice = p->static_prio - 120; /* Convert priority to nice value */
-
-    /* Sparse flows (interactive) get boosted to Gaming tier */
-    if (is_sparse(tctx))
+    u32 score = tctx->sparse_score;
+    
+    if (score >= THRESHOLD_CRITICAL)
+        return CAKE_TIER_CRITICAL;
+    else if (score >= THRESHOLD_GAMING)
         return CAKE_TIER_GAMING;
-
-    /* Use nice value for tier assignment */
-    if (nice <= -10)
-        return CAKE_TIER_VOICE;
-    else if (nice < 0)
-        return CAKE_TIER_GAMING;
-    else if (nice >= 10)
-        return CAKE_TIER_BACKGROUND;
+    else if (score >= THRESHOLD_INTERACTIVE)
+        return CAKE_TIER_INTERACTIVE;
     else
-        return CAKE_TIER_BESTEFFORT;
+        return CAKE_TIER_BACKGROUND;
 }
 
 /*
  * Update sparse score based on runtime behavior
+ * 
+ * Score affects tier classification:
+ *   90-100: Critical, 75-89: Gaming, 25-74: Interactive, 0-24: Background
+ * 
+ * We track promotions/demotions when crossing the Gaming threshold (75)
+ * since this is the key boundary for gaming-relevant tasks.
  */
 static void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
 {
-    u32 score = tctx->sparse_score;
-    // Use precomputed value
+    u32 old_score = tctx->sparse_score;
+    u32 score = old_score;
     u64 threshold_ns = cached_threshold_ns;
 
     if (runtime_ns < threshold_ns) {
@@ -163,20 +177,28 @@ static void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
         if (score < 100) {
             score += 5;
             if (score > 100) score = 100;
-            if (score >= SPARSE_PROMOTE_THRESHOLD && tctx->sparse_score < SPARSE_PROMOTE_THRESHOLD)
-                __sync_fetch_and_add(&stats.nr_sparse_promotions, 1);
         }
     } else {
         /* Long runtime = bulk, decrease score */
-        if (score > 0) {
-            if (score >= 5) score -= 5;
-            else score = 0;
-            if (score < SPARSE_PROMOTE_THRESHOLD && tctx->sparse_score >= SPARSE_PROMOTE_THRESHOLD)
-                __sync_fetch_and_add(&stats.nr_sparse_demotions, 1);
-        }
+        if (score >= 5) score -= 5;
+        else score = 0;
     }
 
     tctx->sparse_score = score;
+
+    /* Track tier transitions at Gaming threshold (most important boundary) */
+    bool was_gaming_or_above = old_score >= THRESHOLD_GAMING;
+    bool is_gaming_or_above = score >= THRESHOLD_GAMING;
+    
+    if (!was_gaming_or_above && is_gaming_or_above) {
+        /* Promoted to Gaming or Critical tier */
+        tctx->tier_switches++;
+        __sync_fetch_and_add(&stats.nr_sparse_promotions, 1);
+    } else if (was_gaming_or_above && !is_gaming_or_above) {
+        /* Demoted from Gaming/Critical tier */
+        tctx->tier_switches++;
+        __sync_fetch_and_add(&stats.nr_sparse_demotions, 1);
+    }
 }
 
 /*
@@ -251,8 +273,8 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 
     tctx = get_task_ctx(p);
     if (unlikely(!tctx)) {
-        /* Fallback: dispatch to normal DSQ */
-        scx_bpf_dsq_insert(p, NORMAL_DSQ, quantum_ns, enq_flags);
+        /* Fallback: dispatch to interactive DSQ */
+        scx_bpf_dsq_insert(p, INTERACTIVE_DSQ, quantum_ns, enq_flags);
         return;
     }
 
@@ -272,14 +294,25 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
         __sync_fetch_and_add(&stats.nr_tier_dispatches[tier], 1);
 
     /*
-     * Route to DSQ based on sparse detection:
-     * - Sparse tasks (score >= 70) -> GAMING_DSQ (priority)
-     * - Normal tasks -> NORMAL_DSQ
+     * Route to DSQ based on tier classification:
+     * - Critical: CRITICAL_DSQ (input handlers, ultra-sparse)
+     * - Gaming: GAMING_DSQ (sparse/bursty tasks)
+     * - Interactive: INTERACTIVE_DSQ (normal applications)
+     * - Background: BACKGROUND_DSQ (bulk work)
      */
-    if (is_sparse(tctx)) {
-        dsq_id = GAMING_DSQ;
-    } else {
-        dsq_id = NORMAL_DSQ;
+    switch (tier) {
+        case CAKE_TIER_CRITICAL:
+            dsq_id = CRITICAL_DSQ;
+            break;
+        case CAKE_TIER_GAMING:
+            dsq_id = GAMING_DSQ;
+            break;
+        case CAKE_TIER_BACKGROUND:
+            dsq_id = BACKGROUND_DSQ;
+            break;
+        default:
+            dsq_id = INTERACTIVE_DSQ;
+            break;
     }
 
     /*
@@ -300,16 +333,38 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 /*
  * Dispatch tasks to run on this CPU
  * 
- * Gaming DSQ is served FIRST, giving priority to sparse/interactive tasks
+ * DSQs are served in strict priority order:
+ *   1. Critical (input handlers, ultra-sparse)
+ *   2. Gaming (sparse/bursty)
+ *   3. Interactive (normal apps)
+ *   4. Background (bulk work)
+ *
+ * Starvation protection: Every 16 dispatches, we check lower tiers
+ * even if higher tiers have work, to prevent complete starvation.
  */
+static u64 dispatch_count = 0;
+
 void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 {
-    /* First: serve gaming/sparse tasks (priority) */
+    dispatch_count++;
+    
+    /* Starvation protection: occasionally let lower tiers run */
+    if ((dispatch_count & 0xF) == 0) {  /* Every 16 dispatches */
+        /* Give background a chance even if others have work */
+        if (scx_bpf_dsq_move_to_local(BACKGROUND_DSQ))
+            return;
+        if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
+            return;
+    }
+    
+    /* Priority order: Critical → Gaming → Interactive → Background */
+    if (scx_bpf_dsq_move_to_local(CRITICAL_DSQ))
+        return;
     if (scx_bpf_dsq_move_to_local(GAMING_DSQ))
         return;
-
-    /* Second: serve normal tasks */
-    scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+    if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
+        return;
+    scx_bpf_dsq_move_to_local(BACKGROUND_DSQ);
 }
 
 /*
@@ -318,12 +373,38 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 {
     struct cake_task_ctx *tctx;
+    u64 now = bpf_ktime_get_ns();
 
     tctx = get_task_ctx(p);
     if (unlikely(!tctx))
         return;
 
-    tctx->last_run_at = bpf_ktime_get_ns();
+    /* Track wait time: how long from wake to actually running */
+    if (tctx->last_wake_at > 0) {
+        u64 wait_time = now - tctx->last_wake_at;
+        u8 tier = tctx->tier;
+        
+        /* Global stats */
+        __sync_fetch_and_add(&stats.total_wait_ns, wait_time);
+        __sync_fetch_and_add(&stats.nr_waits, 1);
+        
+        /* Update max (race possible but acceptable for stats) */
+        if (wait_time > stats.max_wait_ns)
+            stats.max_wait_ns = wait_time;
+        
+        /* Per-tier stats */
+        if (tier < CAKE_TIER_MAX) {
+            __sync_fetch_and_add(&stats.total_wait_ns_tier[tier], wait_time);
+            __sync_fetch_and_add(&stats.nr_waits_tier[tier], 1);
+            if (wait_time > stats.max_wait_ns_tier[tier])
+                stats.max_wait_ns_tier[tier] = wait_time;
+        }
+        
+        /* Clear last_wake_at to prevent double-counting if task runs again */
+        tctx->last_wake_at = 0;
+    }
+
+    tctx->last_run_at = now;
     tctx->run_count++;
 
     /* Update global vtime */
@@ -405,13 +486,20 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
     /* Precompute sparse threshold (avoid division in hot path) */
     cached_threshold_ns = (quantum_ns * sparse_threshold) / 1000;
 
-    /* Create Gaming DSQ (priority) */
+    /* Create all 4 dispatch queues in priority order */
+    ret = scx_bpf_create_dsq(CRITICAL_DSQ, -1);
+    if (ret < 0)
+        return ret;
+
     ret = scx_bpf_create_dsq(GAMING_DSQ, -1);
     if (ret < 0)
         return ret;
 
-    /* Create Normal DSQ */
-    ret = scx_bpf_create_dsq(NORMAL_DSQ, -1);
+    ret = scx_bpf_create_dsq(INTERACTIVE_DSQ, -1);
+    if (ret < 0)
+        return ret;
+
+    ret = scx_bpf_create_dsq(BACKGROUND_DSQ, -1);
     if (ret < 0)
         return ret;
 

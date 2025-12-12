@@ -6,4 +6,4 @@
 // from BPF maps.
 
 /// Priority tier names (matching CAKE's DiffServ tins)
-pub const TIER_NAMES: [&str; 4] = ["Voice", "Gaming", "Best Effort", "Background"];
+pub const TIER_NAMES: [&str; 4] = ["Critical", "Gaming", "Interactive", "Background"];

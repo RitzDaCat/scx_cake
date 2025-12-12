@@ -31,11 +31,11 @@ typedef signed long s64;
  * Priority tiers (like CAKE's DiffServ tins)
  */
 enum cake_tier {
-    CAKE_TIER_VOICE     = 0,  /* Audio, input events - lowest latency */
-    CAKE_TIER_GAMING    = 1,  /* Interactive/gaming - low latency */
-    CAKE_TIER_BESTEFFORT = 2, /* Normal applications - fair share */
-    CAKE_TIER_BACKGROUND = 3, /* Bulk work - lowest priority */
-    CAKE_TIER_MAX       = 4,
+    CAKE_TIER_CRITICAL   = 0,  /* Critical tasks - nice <= -10 (root required) */
+    CAKE_TIER_GAMING     = 1,  /* Gaming/sparse tasks - interactive, low latency */
+    CAKE_TIER_INTERACTIVE = 2, /* Normal interactive - default priority */
+    CAKE_TIER_BACKGROUND = 3,  /* Background/bulk work - lowest priority */
+    CAKE_TIER_MAX        = 4,
 };
 
 /*
@@ -60,6 +60,7 @@ struct cake_task_ctx {
     u32 wake_count;        /* Number of wakeups (for sparse detection) */
     u32 run_count;         /* Number of times scheduled */
     u32 sparse_score;      /* 0-100, higher = more sparse */
+    u32 tier_switches;     /* Count of tier changes (churn indicator) */
     u8  tier;              /* Priority tier */
     u8  flags;             /* Flow flags */
     u8  _pad[2];           /* Padding for alignment */
@@ -79,6 +80,10 @@ struct cake_stats {
     u64 total_wait_ns;             /* Sum of all wait times */
     u64 nr_waits;                  /* Number of wait measurements */
     u64 max_wait_ns;               /* Maximum wait time seen */
+    /* Per-tier wait time tracking */
+    u64 total_wait_ns_tier[CAKE_TIER_MAX];  /* Sum of wait times per tier */
+    u64 nr_waits_tier[CAKE_TIER_MAX];       /* Number of waits per tier */
+    u64 max_wait_ns_tier[CAKE_TIER_MAX];    /* Max wait time per tier */
 };
 
 /*
