@@ -15,6 +15,9 @@ libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
 plain = "0.2"
+ratatui = "0.29"
+crossterm = "0.28"
+arboard = "3.4"
 
 scx_utils = { git = "https://github.com/sched-ext/scx", branch = "main" }
 

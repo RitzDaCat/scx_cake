@@ -28,14 +28,19 @@ typedef signed long s64;
 #endif
 
 /*
- * Priority tiers (like CAKE's DiffServ tins)
+ * Priority tiers with quantum multipliers (6-tier system)
+ * 
+ * Higher tiers get SMALLER slices (more responsive)
+ * Lower tiers get LARGER slices (better throughput)
  */
 enum cake_tier {
-    CAKE_TIER_CRITICAL   = 0,  /* Critical tasks - nice <= -10 (root required) */
-    CAKE_TIER_GAMING     = 1,  /* Gaming/sparse tasks - interactive, low latency */
-    CAKE_TIER_INTERACTIVE = 2, /* Normal interactive - default priority */
-    CAKE_TIER_BACKGROUND = 3,  /* Background/bulk work - lowest priority */
-    CAKE_TIER_MAX        = 4,
+    CAKE_TIER_REALTIME    = 0,  /* Ultra-sparse: input handlers, IRQ threads */
+    CAKE_TIER_CRITICAL    = 1,  /* Very sparse: audio, compositor */
+    CAKE_TIER_GAMING      = 2,  /* Sparse/bursty: game threads, UI */
+    CAKE_TIER_INTERACTIVE = 3,  /* Baseline: default applications */
+    CAKE_TIER_BATCH       = 4,  /* Lower priority: nice > 0, heavy apps */
+    CAKE_TIER_BACKGROUND  = 5,  /* Bulk work: compilers, encoders */
+    CAKE_TIER_MAX         = 6,
 };
 
 /*
@@ -63,7 +68,8 @@ struct cake_task_ctx {
     u32 tier_switches;     /* Count of tier changes (churn indicator) */
     u8  tier;              /* Priority tier */
     u8  flags;             /* Flow flags */
-    u8  _pad[2];           /* Padding for alignment */
+    u8  wait_violations;   /* Consecutive wait budget violations */
+    u8  _pad[1];           /* Padding for alignment */
 };
 
 /*
@@ -75,8 +81,11 @@ struct cake_stats {
     u64 nr_tier_dispatches[CAKE_TIER_MAX]; /* Per-tier dispatch counts */
     u64 nr_sparse_promotions;      /* Sparse flow promotions */
     u64 nr_sparse_demotions;       /* Sparse flow demotions */
+    u64 nr_wait_demotions;         /* Tier demotions due to wait budget violation */
+    u64 nr_wait_demotions_tier[CAKE_TIER_MAX]; /* Per-tier wait demotions (from which tier) */
     u64 nr_input_events;           /* Input events tracked via evdev */
     u64 nr_input_preempts;         /* Safety net preemptions for input */
+    u64 nr_starvation_preempts_tier[CAKE_TIER_MAX]; /* Per-tier starvation preempts */
     u64 total_wait_ns;             /* Sum of all wait times */
     u64 nr_waits;                  /* Number of wait measurements */
     u64 max_wait_ns;               /* Maximum wait time seen */

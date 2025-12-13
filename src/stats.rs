@@ -5,5 +5,5 @@
 // Provides utilities for reading and formatting scheduler statistics
 // from BPF maps.
 
-/// Priority tier names (matching CAKE's DiffServ tins)
-pub const TIER_NAMES: [&str; 4] = ["Critical", "Gaming", "Interactive", "Background"];
+/// Priority tier names (6-tier system with quantum multipliers)
+pub const TIER_NAMES: [&str; 6] = ["Realtime", "Critical", "Gaming", "Interactive", "Batch", "Background"];

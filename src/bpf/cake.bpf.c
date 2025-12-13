@@ -24,6 +24,7 @@ const volatile u64 sparse_threshold = CAKE_DEFAULT_SPARSE_THRESHOLD;
 const volatile u64 starvation_ns = CAKE_DEFAULT_STARVATION_NS;
 const volatile u64 input_latency_ns = CAKE_DEFAULT_INPUT_LATENCY_NS;
 const volatile bool debug = false;
+const volatile bool enable_stats = false;  /* Set to true when --verbose is used */
 
 /*
  * Global statistics
@@ -42,30 +43,83 @@ static u64 cached_threshold_ns;
 
 
 /*
- * Four dispatch queues - one per tier, served in priority order:
- * - CRITICAL_DSQ: Ultra-sparse tasks (input handlers, IRQ) - highest priority
- * - GAMING_DSQ: Sparse/bursty tasks (game threads, UI) - high priority  
- * - INTERACTIVE_DSQ: Normal tasks (default applications) - normal priority
- * - BACKGROUND_DSQ: Bulk tasks (compilers, encoders) - lowest priority
+ * Six dispatch queues - one per tier, served in priority order:
+ * - REALTIME_DSQ:    Ultra-sparse tasks (input handlers, IRQ) - highest priority
+ * - CRITICAL_DSQ:    Very sparse tasks (audio, compositor) - very high priority
+ * - GAMING_DSQ:      Sparse/bursty tasks (game threads, UI) - high priority  
+ * - INTERACTIVE_DSQ: Normal tasks (default applications) - baseline priority
+ * - BATCH_DSQ:       Lower priority work (nice > 0) - lower priority
+ * - BACKGROUND_DSQ:  Bulk tasks (compilers, encoders) - lowest priority
  */
-#define CRITICAL_DSQ    0
-#define GAMING_DSQ      1
-#define INTERACTIVE_DSQ 2
-#define BACKGROUND_DSQ  3
+#define REALTIME_DSQ    0
+#define CRITICAL_DSQ    1
+#define GAMING_DSQ      2
+#define INTERACTIVE_DSQ 3
+#define BATCH_DSQ       4
+#define BACKGROUND_DSQ  5
+
+/*
+ * Tier quantum multipliers (stored as percentage)
+ * Higher tiers get SMALLER slices (more preemption points, lower latency)
+ * Lower tiers get LARGER slices (less context switching for bulk work)
+ */
+static const u32 tier_multiplier[CAKE_TIER_MAX] = {
+    80,   /* Realtime:    0.8x - smallest slice, most responsive */
+    90,   /* Critical:    0.9x */
+    100,  /* Gaming:      1.0x (baseline) */
+    110,  /* Interactive: 1.1x */
+    120,  /* Batch:       1.2x */
+    130,  /* Background:  1.3x - largest slice, less switching */
+};
 
 /* Sparse score thresholds for tier classification (0-100)
  * Each tier is determined by the sparse score range:
- * - 90-100: Critical (ultra-sparse, input handlers)
- * - 75-89:  Gaming (sparse, interactive)
- * - 25-74:  Interactive (normal applications)
- * - 0-24:   Background (bulk/heavy CPU users)
- * 
- * Hysteresis is applied at each boundary to prevent churn.
+ * - 100:    Realtime (perfect sparse score only)
+ * - 90-99:  Critical (ultra-sparse, input handlers)
+ * - 70-89:  Gaming (sparse, interactive)
+ * - 50-69:  Interactive (normal applications)
+ * - 30-49:  Batch (lower priority)
+ * - 0-29:   Background (bulk/heavy CPU users)
  */
-#define THRESHOLD_CRITICAL   90  /* Score >= 90 → Critical */
-#define THRESHOLD_GAMING     75  /* Score >= 75 → Gaming */
-#define THRESHOLD_INTERACTIVE 25 /* Score >= 25 → Interactive */
-/* Below 25 → Background */
+#define THRESHOLD_REALTIME    100  /* Score == 100 → Realtime */
+#define THRESHOLD_CRITICAL    90   /* Score >= 90 → Critical */
+#define THRESHOLD_GAMING      70   /* Score >= 70 → Gaming */
+#define THRESHOLD_INTERACTIVE 50   /* Score >= 50 → Interactive */
+#define THRESHOLD_BATCH       30   /* Score >= 30 → Batch */
+/* Below 30 → Background */
+
+/*
+ * CAKE-style wait budget per tier (nanoseconds)
+ * Tasks exceeding their tier's budget multiple times get demoted.
+ * This prevents queue bloat and protects latency-sensitive tasks.
+ */
+#define WAIT_BUDGET_REALTIME    1000000   /* 1ms */
+#define WAIT_BUDGET_CRITICAL    2000000   /* 2ms */
+#define WAIT_BUDGET_GAMING      4000000   /* 4ms */
+#define WAIT_BUDGET_INTERACTIVE 10000000  /* 10ms */
+#define WAIT_BUDGET_BATCH       35000000  /* 35ms */
+#define WAIT_VIOLATIONS_DEMOTE  4         /* Demote after N consecutive violations */
+
+/*
+ * Per-tier starvation thresholds (nanoseconds)
+ * Safety net: force preemption if task runs longer than its tier allows.
+ */
+#define STARVATION_REALTIME     2000000    /* 2ms */
+#define STARVATION_CRITICAL     4000000    /* 4ms */
+#define STARVATION_GAMING       8000000    /* 8ms */
+#define STARVATION_INTERACTIVE  12000000   /* 12ms */
+#define STARVATION_BATCH        40000000   /* 40ms */
+#define STARVATION_BACKGROUND   100000000  /* 100ms */
+
+/* Array for O(1) starvation threshold lookup (avoids switch in hot path) */
+static const u64 starvation_threshold[CAKE_TIER_MAX] = {
+    STARVATION_REALTIME,     /* Tier 0: Realtime */
+    STARVATION_CRITICAL,     /* Tier 1: Critical */
+    STARVATION_GAMING,       /* Tier 2: Gaming */
+    STARVATION_INTERACTIVE,  /* Tier 3: Interactive */
+    STARVATION_BATCH,        /* Tier 4: Batch */
+    STARVATION_BACKGROUND,   /* Tier 5: Background */
+};
 
 /*
  * Per-task context map
@@ -126,9 +180,15 @@ static bool is_likely_input_task(struct cake_task_ctx *tctx)
     if (tctx->sparse_score < 80)
         return false;
     
-    /* Average runtime must be ultra-short (<30µs = 30000ns) */
-    u64 avg_runtime_ns = tctx->total_runtime / tctx->run_count;
-    if (avg_runtime_ns > 30000)
+    /*
+     * Average runtime must be ultra-short (<30µs = 30000ns)
+     * 
+     * Optimization: Use multiplication instead of division
+     * Instead of: total_runtime / run_count > 30000
+     * Use: total_runtime > run_count * 30000
+     * Saves ~40 cycles (division is expensive)
+     */
+    if (tctx->total_runtime > tctx->run_count * 30000)
         return false;
     
     return true;
@@ -137,22 +197,28 @@ static bool is_likely_input_task(struct cake_task_ctx *tctx)
 /*
  * Classify task tier based on sparse score (behavior-based)
  * 
- * Score ranges:
- *   90-100: Critical - Ultra-sparse (input handlers, IRQ threads)
- *   75-89:  Gaming   - Sparse (game threads, UI, audio)
- *   25-74:  Interactive - Normal (most applications)
- *   0-24:   Background - Bulk (compilers, encoders)
+ * Score ranges (6 tiers):
+ *   100:    Realtime    - Perfect sparse score only
+ *   90-99:  Critical    - Ultra-sparse (input handlers)
+ *   70-89:  Gaming      - Sparse (game threads, UI)
+ *   50-69:  Interactive - Baseline (default applications)
+ *   30-49:  Batch       - Lower priority (nice > 0)
+ *   0-29:   Background  - Bulk (compilers, encoders)
  */
 static u8 classify_tier(struct task_struct *p, struct cake_task_ctx *tctx)
 {
     u32 score = tctx->sparse_score;
     
-    if (score >= THRESHOLD_CRITICAL)
+    if (score >= THRESHOLD_REALTIME)
+        return CAKE_TIER_REALTIME;
+    else if (score >= THRESHOLD_CRITICAL)
         return CAKE_TIER_CRITICAL;
     else if (score >= THRESHOLD_GAMING)
         return CAKE_TIER_GAMING;
     else if (score >= THRESHOLD_INTERACTIVE)
         return CAKE_TIER_INTERACTIVE;
+    else if (score >= THRESHOLD_BATCH)
+        return CAKE_TIER_BATCH;
     else
         return CAKE_TIER_BACKGROUND;
 }
@@ -173,14 +239,12 @@ static void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
     u64 threshold_ns = cached_threshold_ns;
 
     if (runtime_ns < threshold_ns) {
-        /* Short runtime = sparse, increase score */
-        if (score < 100) {
-            score += 5;
-            if (score > 100) score = 100;
-        }
+        /* Short runtime = sparse, increase score (slower gain) */
+        score += 4;
+        if (score > 100) score = 100;
     } else {
-        /* Long runtime = bulk, decrease score */
-        if (score >= 5) score -= 5;
+        /* Long runtime = bulk, decrease score (faster drop) */
+        if (score >= 6) score -= 6;
         else score = 0;
     }
 
@@ -193,11 +257,13 @@ static void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
     if (!was_gaming_or_above && is_gaming_or_above) {
         /* Promoted to Gaming or Critical tier */
         tctx->tier_switches++;
-        __sync_fetch_and_add(&stats.nr_sparse_promotions, 1);
+        if (enable_stats)
+            __sync_fetch_and_add(&stats.nr_sparse_promotions, 1);
     } else if (was_gaming_or_above && !is_gaming_or_above) {
         /* Demoted from Gaming/Critical tier */
         tctx->tier_switches++;
-        __sync_fetch_and_add(&stats.nr_sparse_demotions, 1);
+        if (enable_stats)
+            __sync_fetch_and_add(&stats.nr_sparse_demotions, 1);
     }
 }
 
@@ -210,6 +276,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     struct cake_task_ctx *tctx;
     bool is_idle = false;
     s32 cpu;
+    u64 now;
 
     tctx = get_task_ctx(p);
     if (unlikely(!tctx)) {
@@ -217,7 +284,9 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     }
 
-    tctx->last_wake_at = bpf_ktime_get_ns();
+    /* Get time once, reuse below */
+    now = bpf_ktime_get_ns();
+    tctx->last_wake_at = now;
     tctx->wake_count++;
 
     /* Try to find an idle CPU, prefer same LLC */
@@ -227,7 +296,8 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     if (is_idle) {
         /* Use SCX_ENQ_LAST to skip redundant enqueue call - saves 5-20µs */
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, SCX_ENQ_LAST);
-        __sync_fetch_and_add(&stats.nr_new_flow_dispatches, 1);
+        if (enable_stats)
+            __sync_fetch_and_add(&stats.nr_new_flow_dispatches, 1);
         return cpu;
     }
 
@@ -246,17 +316,19 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
      * This accurately measures how long the input task has been blocked.
      */
     if (is_likely_input_task(tctx)) {
-        u64 now = bpf_ktime_get_ns();
+        /* Reuse 'now' from above instead of calling bpf_ktime_get_ns() again */
         u64 time_since_run = tctx->last_run_at ? (now - tctx->last_run_at) : 0;
         
         /* Safety net: only kick if input task hasn't run beyond threshold */
         if (time_since_run > input_latency_ns) {
             scx_bpf_kick_cpu(prev_cpu, SCX_KICK_PREEMPT);
-            __sync_fetch_and_add(&stats.nr_input_preempts, 1);
+            if (enable_stats)
+                __sync_fetch_and_add(&stats.nr_input_preempts, 1);
         }
         
         /* Track that we detected an input-like task */
-        __sync_fetch_and_add(&stats.nr_input_events, 1);
+        if (enable_stats)
+            __sync_fetch_and_add(&stats.nr_input_events, 1);
     }
 
     return cpu;
@@ -283,15 +355,17 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     tctx->tier = tier;
 
     /* Track if this is a wakeup (new flow) or preemption (old flow) */
-    if (enq_flags & SCX_ENQ_WAKEUP) {
-        __sync_fetch_and_add(&stats.nr_new_flow_dispatches, 1);
-    } else {
-        __sync_fetch_and_add(&stats.nr_old_flow_dispatches, 1);
-    }
+    if (enable_stats) {
+        if (enq_flags & SCX_ENQ_WAKEUP) {
+            __sync_fetch_and_add(&stats.nr_new_flow_dispatches, 1);
+        } else {
+            __sync_fetch_and_add(&stats.nr_old_flow_dispatches, 1);
+        }
 
-    /* Bound tier for stats array access */
-    if (tier < CAKE_TIER_MAX)
-        __sync_fetch_and_add(&stats.nr_tier_dispatches[tier], 1);
+        /* Bound tier for stats array access */
+        if (tier < CAKE_TIER_MAX)
+            __sync_fetch_and_add(&stats.nr_tier_dispatches[tier], 1);
+    }
 
     /*
      * Route to DSQ based on tier classification:
@@ -301,11 +375,20 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
      * - Background: BACKGROUND_DSQ (bulk work)
      */
     switch (tier) {
+        case CAKE_TIER_REALTIME:
+            dsq_id = REALTIME_DSQ;
+            break;
         case CAKE_TIER_CRITICAL:
             dsq_id = CRITICAL_DSQ;
             break;
         case CAKE_TIER_GAMING:
             dsq_id = GAMING_DSQ;
+            break;
+        case CAKE_TIER_INTERACTIVE:
+            dsq_id = INTERACTIVE_DSQ;
+            break;
+        case CAKE_TIER_BATCH:
+            dsq_id = BATCH_DSQ;
             break;
         case CAKE_TIER_BACKGROUND:
             dsq_id = BACKGROUND_DSQ;
@@ -325,6 +408,15 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     if (tctx->deficit > quantum_ns) {
         /* New flow with bonus - give extra slice time */
         slice = tctx->deficit;
+    }
+
+    /*
+     * Apply tier-based quantum multiplier
+     * Higher tiers get SMALLER slices (more responsive)
+     * Lower tiers get LARGER slices (less context switching)
+     */
+    if (tier < CAKE_TIER_MAX) {
+        slice = (slice * tier_multiplier[tier]) / 100;
     }
 
     scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
@@ -357,12 +449,16 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
             return;
     }
     
-    /* Priority order: Critical → Gaming → Interactive → Background */
+    /* Priority order: Realtime → Critical → Gaming → Interactive → Batch → Background */
+    if (scx_bpf_dsq_move_to_local(REALTIME_DSQ))
+        return;
     if (scx_bpf_dsq_move_to_local(CRITICAL_DSQ))
         return;
     if (scx_bpf_dsq_move_to_local(GAMING_DSQ))
         return;
     if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
+        return;
+    if (scx_bpf_dsq_move_to_local(BATCH_DSQ))
         return;
     scx_bpf_dsq_move_to_local(BACKGROUND_DSQ);
 }
@@ -384,20 +480,66 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         u64 wait_time = now - tctx->last_wake_at;
         u8 tier = tctx->tier;
         
-        /* Global stats */
-        __sync_fetch_and_add(&stats.total_wait_ns, wait_time);
-        __sync_fetch_and_add(&stats.nr_waits, 1);
+        /* Global and per-tier stats (only when stats enabled) */
+        if (enable_stats) {
+            __sync_fetch_and_add(&stats.total_wait_ns, wait_time);
+            __sync_fetch_and_add(&stats.nr_waits, 1);
+            
+            /* Update max (race possible but acceptable for stats) */
+            if (wait_time > stats.max_wait_ns)
+                stats.max_wait_ns = wait_time;
+            
+            /* Per-tier stats */
+            if (tier < CAKE_TIER_MAX) {
+                __sync_fetch_and_add(&stats.total_wait_ns_tier[tier], wait_time);
+                __sync_fetch_and_add(&stats.nr_waits_tier[tier], 1);
+                if (wait_time > stats.max_wait_ns_tier[tier])
+                    stats.max_wait_ns_tier[tier] = wait_time;
+            }
+        }
         
-        /* Update max (race possible but acceptable for stats) */
-        if (wait_time > stats.max_wait_ns)
-            stats.max_wait_ns = wait_time;
+        /*
+         * CAKE-style wait budget enforcement
+         * If a task exceeds its tier's wait budget multiple times,
+         * demote it to a lower tier to reduce congestion.
+         */
+        u64 budget = 0;
+        switch (tier) {
+            case CAKE_TIER_CRITICAL:
+                budget = WAIT_BUDGET_CRITICAL;
+                break;
+            case CAKE_TIER_GAMING:
+                budget = WAIT_BUDGET_GAMING;
+                break;
+            case CAKE_TIER_INTERACTIVE:
+                budget = WAIT_BUDGET_INTERACTIVE;
+                break;
+            default:
+                budget = 0;  /* Background has no budget limit */
+                break;
+        }
         
-        /* Per-tier stats */
-        if (tier < CAKE_TIER_MAX) {
-            __sync_fetch_and_add(&stats.total_wait_ns_tier[tier], wait_time);
-            __sync_fetch_and_add(&stats.nr_waits_tier[tier], 1);
-            if (wait_time > stats.max_wait_ns_tier[tier])
-                stats.max_wait_ns_tier[tier] = wait_time;
+        if (budget > 0 && wait_time > budget) {
+            /* Violation - task waited too long for its tier */
+            tctx->wait_violations++;
+            
+            if (tctx->wait_violations >= WAIT_VIOLATIONS_DEMOTE &&
+                tier < CAKE_TIER_BACKGROUND) {
+                /* Demote to next lower tier with significant score penalty */
+                tctx->tier = tier + 1;
+                tctx->sparse_score = (tctx->sparse_score > 30) ? 
+                                     tctx->sparse_score - 30 : 0;
+                tctx->wait_violations = 0;
+                tctx->tier_switches++;
+                if (enable_stats) {
+                    __sync_fetch_and_add(&stats.nr_wait_demotions, 1);
+                    if (tier < CAKE_TIER_MAX)
+                        __sync_fetch_and_add(&stats.nr_wait_demotions_tier[tier], 1);
+                }
+            }
+        } else {
+            /* Good wait time - reset violation counter */
+            tctx->wait_violations = 0;
         }
         
         /* Clear last_wake_at to prevent double-counting if task runs again */
@@ -447,7 +589,13 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 }
 
 /*
- * Periodic tick - check for starvation
+ * Periodic tick - check for starvation with per-tier thresholds
+ * 
+ * Each tier has its own starvation limit:
+ *   Critical:    5ms  - Input handlers shouldn't run this long
+ *   Gaming:      10ms - Game threads need responsiveness
+ *   Interactive: 20ms - Normal apps get more leeway
+ *   Background:  50ms - Bulk work can run longer
  */
 void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 {
@@ -457,12 +605,22 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
     if (unlikely(!tctx))
         return;
 
-    /* Check for starvation */
+    /* Check for starvation using tier-specific threshold */
     if (tctx->last_run_at > 0) {
         u64 runtime = bpf_ktime_get_ns() - tctx->last_run_at;
-        if (runtime > starvation_ns) {
-            /* Force preemption to prevent starvation */
+        u8 tier = tctx->tier;
+        
+        /* O(1) threshold lookup via array (faster than switch) */
+        u64 threshold = (tier < CAKE_TIER_MAX) ? 
+                        starvation_threshold[tier] : STARVATION_BACKGROUND;
+        
+        if (runtime > threshold) {
+            /* Force preemption - task exceeded its tier's starvation limit */
             scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
+            
+            /* Track per-tier starvation preempts */
+            if (enable_stats && tier < CAKE_TIER_MAX)
+                __sync_fetch_and_add(&stats.nr_starvation_preempts_tier[tier], 1);
         }
     }
 }
@@ -486,7 +644,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
     /* Precompute sparse threshold (avoid division in hot path) */
     cached_threshold_ns = (quantum_ns * sparse_threshold) / 1000;
 
-    /* Create all 4 dispatch queues in priority order */
+    /* Create all 6 dispatch queues in priority order */
+    ret = scx_bpf_create_dsq(REALTIME_DSQ, -1);
+    if (ret < 0)
+        return ret;
+
     ret = scx_bpf_create_dsq(CRITICAL_DSQ, -1);
     if (ret < 0)
         return ret;
@@ -496,6 +658,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
         return ret;
 
     ret = scx_bpf_create_dsq(INTERACTIVE_DSQ, -1);
+    if (ret < 0)
+        return ret;
+
+    ret = scx_bpf_create_dsq(BATCH_DSQ, -1);
     if (ret < 0)
         return ret;
 

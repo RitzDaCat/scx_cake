@@ -6,6 +6,7 @@
 // configures it, and displays statistics.
 
 mod stats;
+mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -94,6 +95,7 @@ impl<'a> Scheduler<'a> {
             rodata.starvation_ns = args.starvation * 1000;
             rodata.input_latency_ns = args.input_latency * 1000;
             rodata.debug = args.debug;
+            rodata.enable_stats = args.verbose;  // Only collect stats when --verbose is used
         }
 
         // Load the BPF program
@@ -119,77 +121,31 @@ impl<'a> Scheduler<'a> {
         info!("  Starvation limit: {} µs", self.args.starvation);
         info!("  Input latency:    {} µs", self.args.input_latency);
 
-        // Main loop - print statistics
-        while !shutdown.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(self.args.interval));
+        if self.args.verbose {
+            // Run TUI mode
+            tui::run_tui(&mut self.skel, shutdown.clone(), self.args.interval)?;
+        } else {
+            // Silent mode - just wait for shutdown
+            while !shutdown.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(self.args.interval));
 
-            if self.args.verbose {
-                self.print_stats();
-            }
-
-            // Check for scheduler exit using the UEI
-            if scx_utils::uei_exited!(&self.skel, uei) {
-                match scx_utils::uei_report!(&self.skel, uei) {
-                    Ok(reason) => {
-                        warn!("BPF scheduler exited: {:?}", reason);
+                // Check for scheduler exit using the UEI
+                if scx_utils::uei_exited!(&self.skel, uei) {
+                    match scx_utils::uei_report!(&self.skel, uei) {
+                        Ok(reason) => {
+                            warn!("BPF scheduler exited: {:?}", reason);
+                        }
+                        Err(e) => {
+                            warn!("BPF scheduler exited (failed to get reason: {})", e);
+                        }
                     }
-                    Err(e) => {
-                        warn!("BPF scheduler exited (failed to get reason: {})", e);
-                    }
+                    break;
                 }
-                break;
             }
         }
 
         info!("scx_cake scheduler shutting down");
         Ok(())
-    }
-
-    fn print_stats(&mut self) {
-        let bss = match &mut self.skel.maps.bss_data {
-            Some(bss) => bss,
-            None => return,
-        };
-        let stats = &bss.stats;
-
-        let total_dispatches = stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches;
-        let new_pct = if total_dispatches > 0 {
-            (stats.nr_new_flow_dispatches as f64 / total_dispatches as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let avg_wait_us = if stats.nr_waits > 0 {
-            (stats.total_wait_ns / stats.nr_waits) / 1000
-        } else {
-            0
-        };
-
-        println!("\n=== scx_cake Statistics ===");
-        println!("Dispatches: {} total ({:.1}% new-flow)", total_dispatches, new_pct);
-        println!("  {:12} {:>10}  {:>12}", "Tier", "Dispatches", "Max Wait");
-        for (i, name) in stats::TIER_NAMES.iter().enumerate() {
-            let max_wait_us = stats.max_wait_ns_tier[i] / 1000;
-            println!("  {:12} {:>10}  {:>10} µs", name, stats.nr_tier_dispatches[i], max_wait_us);
-        }
-        println!("Sparse flow: +{} promotions, -{} demotions",
-                 stats.nr_sparse_promotions, stats.nr_sparse_demotions);
-        println!("Input: {} events tracked, {} preempts fired",
-                 stats.nr_input_events, stats.nr_input_preempts);
-        println!("Wait time: avg {} µs, max {} µs (overall)",
-                 avg_wait_us, stats.max_wait_ns / 1000);
-
-        // Reset wait time stats for per-interval measurement
-        let stats_mut = &mut bss.stats;
-        stats_mut.total_wait_ns = 0;
-        stats_mut.nr_waits = 0;
-        stats_mut.max_wait_ns = 0;
-        // Reset per-tier wait stats
-        for i in 0..4 {
-            stats_mut.total_wait_ns_tier[i] = 0;
-            stats_mut.nr_waits_tier[i] = 0;
-            stats_mut.max_wait_ns_tier[i] = 0;
-        }
     }
 }
 
