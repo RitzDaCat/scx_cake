@@ -179,6 +179,27 @@ With a 16-core 9800X3D, there's almost always an idle core available!
 
 ---
 
+## Input Preemption Injection
+
+This is the secret sauce for **8kHz input devices** and saturated systems.
+
+### The Problem
+If all CPUs are busy (e.g., compiling code + gaming), an input interrupt normally has to wait for a running task to yield or finish its slice. This can add **1-4ms of latency**, which feels "floaty".
+
+### The Solution: Preemption Injection
+When a high-priority task (mouse/keyboard IRQ) wakes up and all CPUs are busy:
+1. `scx_cake` finds a CPU running a low-priority task (Batch/Background).
+2. It **immediately** forces a preemption (sends IPI).
+3. The Input task runs instantly (microseconds latency).
+
+### Safety Mechanism
+To prevent "interrupt storms" from 8000Hz mice locking up a core:
+- A **50µs cooldown** is enforced per CPU.
+- We only preempt if the last preemption was >50µs ago.
+- This creates a safe upper bound while maintaining near-perfect responsiveness.
+
+---
+
 ## Wait Budget System
 
 **Borrowed from CAKE's Active Queue Management (AQM).**
@@ -336,7 +357,7 @@ Batch                1921      5313 µs             0            20
 Background          28004      1487 µs             0          5530
 
 Sparse flow: +68343 promotions, -67688 demotions, 0 wait-demotes
-Input: 263805 events tracked, 36205 preempts fired
+Input: 3262 preempts fired
 Wait time: avg 0 µs, max 5313 µs
 ```
 

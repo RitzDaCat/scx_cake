@@ -5,5 +5,5 @@
 // Provides utilities for reading and formatting scheduler statistics
 // from BPF maps.
 
-/// Priority tier names (6-tier system with quantum multipliers)
-pub const TIER_NAMES: [&str; 6] = ["Realtime", "Critical", "Gaming", "Interactive", "Batch", "Background"];
+/// Priority tier names (7-tier system with quantum multipliers)
+pub const TIER_NAMES: [&str; 7] = ["CritLatency", "Realtime", "Critical", "Gaming", "Interactive", "Batch", "Background"];

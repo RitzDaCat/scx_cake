@@ -28,19 +28,20 @@ typedef signed long s64;
 #endif
 
 /*
- * Priority tiers with quantum multipliers (6-tier system)
+ * Priority tiers with quantum multipliers (7-tier system)
  * 
  * Higher tiers get SMALLER slices (more responsive)
  * Lower tiers get LARGER slices (better throughput)
  */
 enum cake_tier {
-    CAKE_TIER_REALTIME    = 0,  /* Ultra-sparse: input handlers, IRQ threads */
-    CAKE_TIER_CRITICAL    = 1,  /* Very sparse: audio, compositor */
-    CAKE_TIER_GAMING      = 2,  /* Sparse/bursty: game threads, UI */
-    CAKE_TIER_INTERACTIVE = 3,  /* Baseline: default applications */
-    CAKE_TIER_BATCH       = 4,  /* Lower priority: nice > 0, heavy apps */
-    CAKE_TIER_BACKGROUND  = 5,  /* Bulk work: compilers, encoders */
-    CAKE_TIER_MAX         = 6,
+    CAKE_TIER_CRITICAL_LATENCY = 0,  /* Ultra-low latency: score=100 AND <250µs avg runtime */
+    CAKE_TIER_REALTIME    = 1,  /* Ultra-sparse: score=100 but >=250µs avg runtime */
+    CAKE_TIER_CRITICAL    = 2,  /* Very sparse: audio, compositor */
+    CAKE_TIER_GAMING      = 3,  /* Sparse/bursty: game threads, UI */
+    CAKE_TIER_INTERACTIVE = 4,  /* Baseline: default applications */
+    CAKE_TIER_BATCH       = 5,  /* Lower priority: nice > 0, heavy apps */
+    CAKE_TIER_BACKGROUND  = 6,  /* Bulk work: compilers, encoders */
+    CAKE_TIER_MAX         = 7,
 };
 
 /*
@@ -61,15 +62,14 @@ struct cake_task_ctx {
     u64 last_run_at;       /* Last time task ran (ns) */
     u64 total_runtime;     /* Total accumulated runtime (ns) */
     u64 last_wake_at;      /* Last wakeup time (ns) */
-    u64 last_input_at;     /* Last time processed input event (ns) */
     u32 wake_count;        /* Number of wakeups (for sparse detection) */
     u32 run_count;         /* Number of times scheduled */
     u32 sparse_score;      /* 0-100, higher = more sparse */
     u32 tier_switches;     /* Count of tier changes (churn indicator) */
+    u16 wait_violations;   /* Total wait budget violations */
+    u16 wait_checks;       /* Total wait budget checks (for ratio) */
     u8  tier;              /* Priority tier */
     u8  flags;             /* Flow flags */
-    u8  wait_violations;   /* Consecutive wait budget violations */
-    u8  _pad[1];           /* Padding for alignment */
 };
 
 /*
@@ -83,8 +83,6 @@ struct cake_stats {
     u64 nr_sparse_demotions;       /* Sparse flow demotions */
     u64 nr_wait_demotions;         /* Tier demotions due to wait budget violation */
     u64 nr_wait_demotions_tier[CAKE_TIER_MAX]; /* Per-tier wait demotions (from which tier) */
-    u64 nr_input_events;           /* Input events tracked via evdev */
-    u64 nr_input_preempts;         /* Safety net preemptions for input */
     u64 nr_starvation_preempts_tier[CAKE_TIER_MAX]; /* Per-tier starvation preempts */
     u64 total_wait_ns;             /* Sum of all wait times */
     u64 nr_waits;                  /* Number of wait measurements */
@@ -93,6 +91,7 @@ struct cake_stats {
     u64 total_wait_ns_tier[CAKE_TIER_MAX];  /* Sum of wait times per tier */
     u64 nr_waits_tier[CAKE_TIER_MAX];       /* Number of waits per tier */
     u64 max_wait_ns_tier[CAKE_TIER_MAX];    /* Max wait time per tier */
+    u64 nr_input_preempts;                 /* Preemptions injected for input/latency */
 };
 
 /*
@@ -110,7 +109,6 @@ struct cake_config {
 #define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)   /* 8ms */
 #define CAKE_DEFAULT_SPARSE_THRESHOLD   100                  /* 10% = 100 permille */
 #define CAKE_DEFAULT_STARVATION_NS      (100 * 1000 * 1000) /* 100ms */
-#define CAKE_DEFAULT_INPUT_LATENCY_NS   (1 * 1000 * 1000)   /* 1ms */
 
 /* DSQ IDs - per tier, with new/old flow variants */
 #define CAKE_DSQ_NEW_BASE   0x100

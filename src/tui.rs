@@ -114,8 +114,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
     
     output.push_str(&format!("\nSparse flow: +{} promotions, -{} demotions, {} wait-demotes\n",
         stats.nr_sparse_promotions, stats.nr_sparse_demotions, stats.nr_wait_demotions));
-    output.push_str(&format!("Input: {} events tracked, {} preempts fired\n",
-        stats.nr_input_events, stats.nr_input_preempts));
+    output.push_str(&format!("Input: {} preempts fired\n", stats.nr_input_preempts));
     output.push_str(&format!("Wait time: avg {} µs, max {} µs\n",
         avg_wait_us, stats.max_wait_ns / 1000));
     
@@ -203,10 +202,10 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     };
     let summary_text = format!(
         " Sparse flow: +{} promotions, -{} demotions, {} wait-demotes\n \
-         Input: {} events, {} preempts\n \
+         Input: {} preempts fired\n \
          Wait time: avg {} µs, max {} µs (overall)",
         stats.nr_sparse_promotions, stats.nr_sparse_demotions, stats.nr_wait_demotions,
-        stats.nr_input_events, stats.nr_input_preempts,
+        stats.nr_input_preempts,
         avg_wait_us, stats.max_wait_ns / 1000
     );
     let summary = Paragraph::new(summary_text)
@@ -237,10 +236,13 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
 /// Get color style for a tier
 fn tier_style(tier: usize) -> Style {
     match tier {
-        0 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),     // Critical
-        1 => Style::default().fg(Color::Magenta),                               // Gaming
-        2 => Style::default().fg(Color::Green),                                 // Interactive
-        3 => Style::default().fg(Color::DarkGray),                              // Background
+        0 => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),   // CritLatency - highest priority
+        1 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),    // Realtime
+        2 => Style::default().fg(Color::Magenta),                              // Critical
+        3 => Style::default().fg(Color::Green),                                // Gaming
+        4 => Style::default().fg(Color::Yellow),                               // Interactive
+        5 => Style::default().fg(Color::Blue),                                 // Batch
+        6 => Style::default().fg(Color::DarkGray),                             // Background
         _ => Style::default(),
     }
 }
@@ -309,7 +311,8 @@ pub fn run_tui(
                                 stats_mut.total_wait_ns = 0;
                                 stats_mut.nr_waits = 0;
                                 stats_mut.max_wait_ns = 0;
-                                for i in 0..4 {
+                                stats_mut.nr_input_preempts = 0;
+                                for i in 0..7 {  // 7 tiers: CritLatency, Realtime, Critical, Gaming, Interactive, Batch, Background
                                     stats_mut.total_wait_ns_tier[i] = 0;
                                     stats_mut.nr_waits_tier[i] = 0;
                                     stats_mut.max_wait_ns_tier[i] = 0;

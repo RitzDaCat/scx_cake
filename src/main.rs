@@ -54,10 +54,6 @@ struct Args {
     #[arg(long, default_value_t = 100000)]
     starvation: u64,
 
-    /// Input latency ceiling in microseconds - safety net preempts if input task waits longer
-    #[arg(long, default_value_t = 1000)]
-    input_latency: u64,
-
     /// Enable verbose debug output
     #[arg(long, short)]
     verbose: bool,
@@ -93,7 +89,6 @@ impl<'a> Scheduler<'a> {
             rodata.new_flow_bonus_ns = args.new_flow_bonus * 1000;
             rodata.sparse_threshold = args.sparse_threshold;
             rodata.starvation_ns = args.starvation * 1000;
-            rodata.input_latency_ns = args.input_latency * 1000;
             rodata.debug = args.debug;
             rodata.enable_stats = args.verbose;  // Only collect stats when --verbose is used
         }
@@ -119,7 +114,6 @@ impl<'a> Scheduler<'a> {
         info!("  New flow bonus:   {} µs", self.args.new_flow_bonus);
         info!("  Sparse threshold: {}‰", self.args.sparse_threshold);
         info!("  Starvation limit: {} µs", self.args.starvation);
-        info!("  Input latency:    {} µs", self.args.input_latency);
 
         if self.args.verbose {
             // Run TUI mode
