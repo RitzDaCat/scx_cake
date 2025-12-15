@@ -135,8 +135,8 @@ static const u64 wait_budget[CAKE_TIER_MAX] = {
  * 
  * Formula: Starvation = 2x Wait Budget (except Background which has generous limit)
  */
-#define STARVATION_CRITICAL_LATENCY 200000   /* 200µs - 2x wait budget */
-#define STARVATION_REALTIME     1500000    /* 1.5ms - 2x wait budget */
+#define STARVATION_CRITICAL_LATENCY 5000000  /* 5ms - 2x wait budget */
+#define STARVATION_REALTIME     3000000    /* 3ms - 2x wait budget */
 #define STARVATION_CRITICAL     4000000    /* 4ms - 2x wait budget */
 #define STARVATION_GAMING       8000000    /* 8ms - 2x wait budget */
 #define STARVATION_INTERACTIVE  16000000   /* 16ms - 2x wait budget */

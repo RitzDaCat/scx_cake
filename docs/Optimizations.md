@@ -59,3 +59,25 @@ This document records the hardware-level optimizations and architectural experim
 **Status:** ✅ Implemented
 - Replaced `if (runtime < threshold)` branching logic with arithmetic logic.
 - **Benefit:** Mitigates branch misprediction penalties in the scheduler's most frequent code path.
+
+
+## 4. Starvation & Tier Tuning (Esports Strategy)
+
+### "Strict Entry, Generous Exit"
+**Status:** ✅ Implemented
+**Goal:** Resolve the paradox where high-performance input tasks (Avg 30µs) occasionally spike (800µs) and get demoted/stuttered by strict safety nets.
+
+**Experiment 1: Strict Limits (200µs)**
+*   **Result:** High "Starvation Preempts" (~30k/session).
+*   **Impact:** Any frame processing taking >200µs was killed instantly, causing micro-stutters and 5ms+ latency spikes (waiting for next slice).
+
+**Experiment 2: Expanded Preemption (Score >= 90)**
+*   **Idea:** Allow tasks with Score 90-99 (Critical) to trigger "Input Preemption" to eliminate wait times.
+*   **Result:** **Regression.** 1% Low FPS dropped by 60 frames.
+*   **Diagnosis:** "Noisy Neighbor" problem. Semi-active apps (Discord, Browser) with Score 94 started interrupting the main Game Thread.
+
+**Golden Configuration:**
+*   **Strict Entry:** Only \`Score == 100\` tasks qualify for \`CritLatency\` (VIP Tier).
+*   **Generous Exit:** \`CritLatency\` Starvation Limit increased to **5ms (5000µs)**.
+*   **Reasoning:** We filter aggressively at the door (Score 100), but once a task is trusted, we give it ample room to finish work without interruption.
+*   **Result:** 1% Low FPS recovered to ~180. StarvPreempts dropped to near zero.
