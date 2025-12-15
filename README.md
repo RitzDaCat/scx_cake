@@ -37,7 +37,7 @@ scx_cake is designed specifically for gaming:
 |-----------------------|----------|
 | Treats all tasks equally | Prioritizes input handlers |
 | Queues tasks fairly | Direct dispatch to idle CPUs |
-| One priority level | 6 priority tiers |
+| One priority level | 7 priority tiers |
 | Fixed time slices | Adaptive slices based on behavior |
 
 ---
@@ -49,44 +49,36 @@ Imagine a busy restaurant kitchen:
 1. **Regular kitchens:** Orders wait in one big line. A 30-minute steak order blocks a 2-minute salad order.
 
 2. **scx_cake kitchen:** 
+   - VIP orders (mouse movements) go to the VIP lane
    - Quick orders (salads) go to a fast lane
    - Slow orders (steaks) go to a regular lane
-   - Fast lane is always served first
+   - VIP/Fast lanes are always served first
    - If a quick order waits too long, the chef drops everything and makes it immediately
 
 **In CPU terms:**
-- **Quick orders** = Input handlers, game threads (run for microseconds)
-- **Slow orders** = Compilers, encoders (run for seconds)
-- **Fast lane** = Higher priority dispatch queues
+- **VIP orders** = Mouse/Keyboard interrupts (Critical Latency)
+- **Quick orders** = Game threads
+- **Slow orders** = Compilers, encoders
+- **VIP lane** = Top priority dispatch queues
 - **Chef drops everything** = Preemption safety net
 
 ---
 
-## The 6-Tier System
+## The 7-Tier System
 
-scx_cake sorts tasks into 6 priority tiers based on their behavior:
+scx_cake sorts tasks into 7 priority tiers based on their behavior:
 
 | Tier | Score Range | Example Tasks | Dispatch Priority |
 |------|-------------|---------------|-------------------|
-| **Realtime** | 100 | Input handlers, IRQ threads | 1st (highest) |
-| **Critical** | 90-99 | Audio, compositor | 2nd |
-| **Gaming** | 70-89 | Game threads, UI | 3rd |
-| **Interactive** | 50-69 | Normal apps | 4th |
-| **Batch** | 30-49 | Nice > 0, heavy apps | 5th |
-| **Background** | 0-29 | Compilers, encoders | 6th (lowest) |
+| **Critical Latency** | 100* | Mouse/Keyboard IRQ, <50µs runtime | 1st (highest) |
+| **Realtime** | 100* | Network IRQ, <500µs runtime | 2nd |
+| **Critical** | 90-100 | Audio, compositor | 3rd |
+| **Gaming** | 70-89 | Game threads, UI | 4th |
+| **Interactive** | 50-69 | Normal apps | 5th |
+| **Batch** | 30-49 | Nice > 0, heavy apps | 6th |
+| **Background** | 0-29 | Compilers, encoders | 7th (lowest) |
 
-### How Tasks Get Their Tier
-
-Each task has a **sparse score** from 0-100. Higher = more responsive, lower = more bulk-work.
-
-```
-Score >= 100  →  Realtime tier   (perfect behavior)
-Score >= 90   →  Critical tier   (very responsive)
-Score >= 70   →  Gaming tier     (responsive)
-Score >= 50   →  Interactive tier (normal)
-Score >= 30   →  Batch tier      (slower)
-Score < 30    →  Background tier (bulk work)
-```
+*\*Tasks with Score 100 are split into Critical Latency, Realtime, or Critical based on average runtime.*
 
 ### Tier Slice Multipliers
 
@@ -94,7 +86,8 @@ Higher tiers get **smaller** time slices (more responsive):
 
 | Tier | Multiplier | Slice (2ms quantum) | Why |
 |------|------------|---------------------|-----|
-| Realtime | 0.8x | 1.6ms | Shortest - yields quickly, lets others run |
+| Critical Latency | 0.7x | 1.4ms | Minimal latency |
+| Realtime | 0.8x | 1.6ms | Shortest - yields quickly |
 | Critical | 0.9x | 1.8ms | Short |
 | Gaming | 1.0x | 2.0ms | Baseline |
 | Interactive | 1.1x | 2.2ms | Slightly longer |
@@ -210,11 +203,12 @@ If a task waits too long in queue (congestion), it gets demoted to reduce pressu
 
 | Tier | Wait Budget | Meaning |
 |------|-------------|---------|
-| Realtime | 1ms | If waiting > 1ms, something's wrong |
+| Critical Latency | 100µs | Must run INSTANTLY |
+| Realtime | 750µs | Must run extremely fast |
 | Critical | 2ms | Should run within 2ms |
 | Gaming | 4ms | Should run within 4ms |
-| Interactive | 10ms | More leeway |
-| Batch | 35ms | Low priority, can wait |
+| Interactive | 8ms | More leeway |
+| Batch | 20ms | Low priority, can wait |
 
 ### Violation Tracking
 
@@ -240,10 +234,11 @@ Ensures no task runs forever without yielding.
 
 | Tier | Limit | Meaning |
 |------|-------|---------|
-| Realtime | 2ms | Force preempt if running > 2ms |
+| Critical Latency | 200 µs | Force preempt immediately |
+| Realtime | 1.5ms | Force preempt if running > 1.5ms |
 | Critical | 4ms | Force preempt if running > 4ms |
 | Gaming | 8ms | Force preempt if running > 8ms |
-| Interactive | 12ms | Force preempt if running > 12ms |
+| Interactive | 16ms | Force preempt if running > 16ms |
 | Batch | 40ms | Force preempt if running > 40ms |
 | Background | 100ms | Force preempt if running > 100ms |
 
@@ -259,7 +254,6 @@ If a task exceeds its limit, the scheduler forcibly preempts it.
 |--------|---------|-------------|
 | `--quantum` | 2000 µs | Base time slice |
 | `--sparse-threshold` | 50‰ | Runtime threshold for sparse detection |
-| `--input-latency` | 1000 µs | Safety net preemption ceiling |
 | `--new-flow-bonus` | 8000 µs | Extra time for freshly woken tasks |
 | `--starvation` | 100000 µs | Global starvation limit |
 | `-v, --verbose` | false | Enable TUI with live statistics |
@@ -349,12 +343,13 @@ Dispatches: 288606191 total (99.8% new-flow)
 
 Tier           Dispatches    Max Wait    WaitDemote  StarvPreempt
 ─────────────────────────────────────────────────────────────────
-Realtime           572319      2345 µs             0            29
-Critical            76147      2120 µs             0          4687
-Gaming              12443      2113 µs             0          3726
-Interactive          3615      1932 µs             0          1527
-Batch                1921      5313 µs             0            20
-Background          28004      1487 µs             0          5530
+Critical Latency   12431        23 µs             0             0
+Realtime           572319      145 µs             0            29
+Critical            76147     2120 µs             0          4687
+Gaming              12443     2113 µs             0          3726
+Interactive          3615     1932 µs             0          1527
+Batch                1921     5313 µs             0            20
+Background          28004     1487 µs             0          5530
 
 Sparse flow: +68343 promotions, -67688 demotions, 0 wait-demotes
 Input: 3262 preempts fired
@@ -405,12 +400,14 @@ scx_cake/
 
 ```c
 struct cake_task_ctx {
-    u64 deficit;        // Time owed to this task
-    u64 last_run_at;    // When task last ran
-    u64 total_runtime;  // Accumulated runtime
-    u32 sparse_score;   // 0-100, behavior score
-    u8  tier;           // Current priority tier
-    u8  wait_violations; // Consecutive budget violations
+    u64 last_run_at;       /* Last time task ran (ns) */
+    u64 last_wake_at;      /* Last wakeup time (ns) */
+    u64 deficit;           /* Time owed to this task (ns) */
+    u32 avg_runtime_us;    /* EWMA Average Runtime (microseconds) */
+    u8  sparse_score;      /* 0-100, higher = more sparse */
+    u8  tier;              /* Priority tier */
+    u8  flags;             /* Flow flags */
+    u8  wait_data;         /* Packed: [7:4] violations, [3:0] checks */
 };
 ```
 
