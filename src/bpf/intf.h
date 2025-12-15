@@ -57,19 +57,19 @@ enum cake_flow_flags {
 /*
  * Per-task flow state tracked in BPF
  */
+/*
+ * Per-task flow state tracked in BPF (32 bytes - Double Density)
+ * Fits 2 contexts per 64-byte cache line.
+ */
 struct cake_task_ctx {
-    u64 deficit;           /* Time owed to this task (ns) */
     u64 last_run_at;       /* Last time task ran (ns) */
-    u64 total_runtime;     /* Total accumulated runtime (ns) */
     u64 last_wake_at;      /* Last wakeup time (ns) */
-    u32 wake_count;        /* Number of wakeups (for sparse detection) */
-    u32 run_count;         /* Number of times scheduled */
-    u32 sparse_score;      /* 0-100, higher = more sparse */
-    u32 tier_switches;     /* Count of tier changes (churn indicator) */
-    u16 wait_violations;   /* Total wait budget violations */
-    u16 wait_checks;       /* Total wait budget checks (for ratio) */
+    u64 deficit;           /* Time owed to this task (ns) */
+    u32 avg_runtime_us;    /* EWMA Average Runtime (microseconds) */
+    u8  sparse_score;      /* 0-100, higher = more sparse */
     u8  tier;              /* Priority tier */
     u8  flags;             /* Flow flags */
+    u8  wait_data;         /* Packed: [7:4] violations, [3:0] checks */
 };
 
 /*

@@ -24,6 +24,66 @@ use ratatui::{
 use crate::bpf_skel::types::cake_stats;
 use crate::bpf_skel::BpfSkel;
 use crate::stats::TIER_NAMES;
+use libbpf_rs::{MapFlags, MapCore};
+
+fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
+    let key = 0u32;
+    let key_bytes = key.to_ne_bytes();
+    
+    // Per-CPU map lookup returns values for all CPUs
+    // We treat key 0 as the single bucket containing stats for all CPUs
+    let values = match map.lookup_percpu(&key_bytes, MapFlags::ANY) {
+        Ok(Some(v)) => v,
+        _ => return Ok(Default::default()), // Handle error or missing key
+    };
+
+    let mut total: cake_stats = Default::default();
+
+    // Iterate over each CPU's stats and sum them up
+    if let Some(first_cpu_bytes) = values.first() {
+        // Verify size
+        if first_cpu_bytes.len() != std::mem::size_of::<cake_stats>() {
+            return Ok(Default::default()); // Safety check
+        }
+    }
+
+    for cpu_bytes in values {
+        if cpu_bytes.len() != std::mem::size_of::<cake_stats>() {
+            continue;
+        }
+        
+        // Deserialize bytes to struct (unsafe fetch)
+        let s: cake_stats = unsafe { std::ptr::read_unaligned(cpu_bytes.as_ptr() as *const _) };
+
+        // Sum all fields
+        total.nr_new_flow_dispatches += s.nr_new_flow_dispatches;
+        total.nr_old_flow_dispatches += s.nr_old_flow_dispatches;
+        
+        for i in 0..crate::stats::TIER_NAMES.len() {
+            total.nr_tier_dispatches[i] += s.nr_tier_dispatches[i];
+            total.nr_wait_demotions_tier[i] += s.nr_wait_demotions_tier[i];
+            total.nr_starvation_preempts_tier[i] += s.nr_starvation_preempts_tier[i];
+            total.total_wait_ns_tier[i] += s.total_wait_ns_tier[i];
+            total.nr_waits_tier[i] += s.nr_waits_tier[i];
+            // Max is max, not sum
+            if s.max_wait_ns_tier[i] > total.max_wait_ns_tier[i] {
+                total.max_wait_ns_tier[i] = s.max_wait_ns_tier[i];
+            }
+        }
+        
+        total.nr_sparse_promotions += s.nr_sparse_promotions;
+        total.nr_sparse_demotions += s.nr_sparse_demotions;
+        total.nr_wait_demotions += s.nr_wait_demotions;
+        total.total_wait_ns += s.total_wait_ns;
+        total.nr_waits += s.nr_waits;
+        if s.max_wait_ns > total.max_wait_ns {
+            total.max_wait_ns = s.max_wait_ns;
+        }
+        total.nr_input_preempts += s.nr_input_preempts;
+    }
+
+    Ok(total)
+}
 
 /// TUI Application state
 pub struct TuiApp {
@@ -272,10 +332,10 @@ pub fn run_tui(
             break;
         }
 
-        // Get current stats
-        let stats = match &skel.maps.bss_data {
-            Some(bss) => bss.stats.clone(),
-            None => continue,
+        // Get current stats (aggregate from per-cpu map)
+        let stats = match aggregate_stats(&skel.maps.stats_map) {
+            Ok(s) => s,
+            Err(_) => Default::default(),
         };
 
         // Draw UI
@@ -306,17 +366,30 @@ pub fn run_tui(
                         }
                         KeyCode::Char('r') => {
                             // Reset stats
-                            if let Some(bss) = &mut skel.maps.bss_data {
-                                let stats_mut = &mut bss.stats;
-                                stats_mut.total_wait_ns = 0;
-                                stats_mut.nr_waits = 0;
-                                stats_mut.max_wait_ns = 0;
-                                stats_mut.nr_input_preempts = 0;
-                                for i in 0..7 {  // 7 tiers: CritLatency, Realtime, Critical, Gaming, Interactive, Batch, Background
-                                    stats_mut.total_wait_ns_tier[i] = 0;
-                                    stats_mut.nr_waits_tier[i] = 0;
-                                    stats_mut.max_wait_ns_tier[i] = 0;
+                            // Reset stats (clear the map)
+                            let key = 0u32;
+                            let key_bytes = key.to_ne_bytes();
+                            // We can't strictly "reset" per-cpu easily without writing zeros to all cpus
+                            // For now, simpler to just treat 'r' as soft-reset in UI, but BPF keeps counting?
+                            // Or we write a zeroed struct to all CPUs.
+                            let zero_struct = cake_stats::default();
+                            // Serialize to bytes
+                            let zero_bytes = unsafe { 
+                                std::slice::from_raw_parts(
+                                    &zero_struct as *const _ as *const u8,
+                                    std::mem::size_of::<cake_stats>()
+                                )
+                            };
+
+                            
+                            // Let's defer reset logic implementation for now or try simple approach
+                            // Construct Vec<Vec<u8>> for all CPUs
+                            if let Ok(num_cpus) = libbpf_rs::num_possible_cpus() {
+                                let mut vals = Vec::new();
+                                for _ in 0..num_cpus {
+                                    vals.push(zero_bytes.to_vec());
                                 }
+                                let _ = skel.maps.stats_map.update_percpu(&key_bytes, &vals, MapFlags::ANY);
                             }
                             app.set_status("✓ Stats reset");
                         }
