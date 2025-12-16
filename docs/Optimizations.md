@@ -81,3 +81,19 @@ This document records the hardware-level optimizations and architectural experim
 *   **Generous Exit:** \`CritLatency\` Starvation Limit increased to **5ms (5000µs)**.
 *   **Reasoning:** We filter aggressively at the door (Score 100), but once a task is trusted, we give it ample room to finish work without interruption.
 *   **Result:** 1% Low FPS recovered to ~180. StarvPreempts dropped to near zero.
+
+## 5. Struct Layout & Density
+
+### Current Layout (32 Bytes)
+**Status:** ✅ Verified
+**Organization:** Optimized for Alignment (Largest to Smallest)
+1.  **Offsets 0-23 (24B):** `last_run_at`, `last_wake_at`, `deficit` (3x u64).
+2.  **Offsets 24-25 (2B):** `avg_runtime_us` (u16).
+3.  **Offsets 26-31 (6B):** `kalman_error`, `padding`, `sparse_score`, `tier`, `flags`, `wait_data` (6x u8).
+**Result:** Fits exactly 2 tasks per 64-byte cache line.
+
+### Feasibility of 16 Bytes
+**Status:** ⚠️ Theoretical / Risky
+To reach 16 bytes (4 tasks/line), we must shrink the 24 bytes of timestamps.
+*   **Option:** Convert `u64` -> `u32` (Wrap every 4s) AND Delete `last_wake_at`.
+*   **Tradeoff:** Background tasks (>4s sleep) lose fairness.

@@ -55,22 +55,34 @@ enum cake_flow_flags {
 };
 
 /*
- * Per-task flow state tracked in BPF
- */
-/*
- * Per-task flow state tracked in BPF (32 bytes - Double Density)
- * Fits 2 contexts per 64-byte cache line.
+ * Per-task flow state tracked in BPF (16 bytes - Quad Density)
+ * Fits 4 contexts per 64-byte cache line.
+ * 
+ * COMPRESSION:
+ * - Timestamps: u32 (Wraps every 4.2s) - Acceptable for active gaming.
+ * - Info: Packed into single u32 bitfield.
  */
 struct cake_task_ctx {
-    u64 last_run_at;       /* Last time task ran (ns) */
-    u64 last_wake_at;      /* Last wakeup time (ns) */
-    u64 deficit;           /* Time owed to this task (ns) */
-    u32 avg_runtime_us;    /* EWMA Average Runtime (microseconds) */
-    u8  sparse_score;      /* 0-100, higher = more sparse */
-    u8  tier;              /* Priority tier */
-    u8  flags;             /* Flow flags */
-    u8  wait_data;         /* Packed: [7:4] violations, [3:0] checks */
+    u32 last_run_at;       /* 4B: Last run (ns), wraps 4.2s */
+    u32 last_wake_ts;      /* 4B: NEW: Wake TS (ns), wraps 4.2s */
+    u32 packed_info;       /* 4B: Bitfield (Err, Wait, Score, Tier, Flags) */
+    u16 deficit_us;        /* 2B: NEW: Deficit (us), max 65ms */
+    u16 avg_runtime_us;    /* 2B: HFT Kalman Estimate */
 };
+
+/* Bitfield Offsets for packed_info */
+#define SHIFT_KALMAN_ERROR  0
+#define SHIFT_WAIT_DATA     8
+#define SHIFT_SPARSE_SCORE  16
+#define SHIFT_TIER          23
+#define SHIFT_FLAGS         26
+/* 30-31 Reserved */
+
+#define MASK_KALMAN_ERROR   0xFF
+#define MASK_WAIT_DATA      0xFF
+#define MASK_SPARSE_SCORE   0x7F
+#define MASK_TIER           0x07
+#define MASK_FLAGS          0x0F
 
 /*
  * Statistics shared with userspace
