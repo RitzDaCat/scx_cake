@@ -21,7 +21,7 @@ Counts are estimates based on BPF instruction complexity (x86_64 JIT).
 | Operation | Type | Cost (Cycles) | Notes |
 | :--- | :--- | :--- | :--- |
 | `scx_bpf_dsq_move_to_local` | Helper | 20-50 | Unavoidable (Kernel Logic) |
-| Starvation Check | **ALU** | **0** | Replaced RDTSC with `(pid+slice)&0xF` |
+| Starvation Check | **ALU** | **0** | `(pid ^ runtime) & 0xF` (Using System Jitter) |
 | **Total Overhead** | | **~30** | **Dominated by Kernel Helper** |
 
 ## 2. `cake_enqueue` (Task Wake/Slice)
@@ -39,15 +39,16 @@ Counts are estimates based on BPF instruction complexity (x86_64 JIT).
 
 ## 3. `cake_select_cpu` (Wakeup Decision)
 **Frequency:** High
-**Optimization:** Consolidated Logic
+**Optimization:** Sticky Fast Path vs Slow Path
 
 | Operation | Type | Cost (Cycles) | Notes |
 | :--- | :--- | :--- | :--- |
 | `get_task_ctx` | Map | 20 | |
 | `bpf_ktime_get_ns` | Time | 25 | **Consolidated to 1 Call** |
-| `select_cpu_dfl` | Helper | 100+ | Heavy Kernel Logic (Search LLC) |
-| Preempt Check | Map+ALU | 30 | Only on contention |
-| **Total Overhead** | | **~175** | **Dominated by Kernel Search** |
+| **Sticky Path** (L1 Cached) | Helper | **< 20** | `scx_bpf_cpu_curr` (Skips search if prev idle) |
+| **Fail-Fast** (Saturation) | Map | **20** | `idle_stats` check. If 0, skip search. |
+| **Slow Path** (LLC Search) | Helper | 100+ | Only runs if idle CPUs exist & local is busy. |
+| **Total Overhead** | | **~65** | **(Average Case)** |
 
 ## 4. `cake_stopping` (Accounting)
 **Frequency:** High (Context Switch)

@@ -16,6 +16,8 @@
 #include "intf.h"
 
 extern struct task_struct *scx_bpf_cpu_curr(s32 cpu) __ksym;
+extern void bpf_rcu_read_lock(void) __ksym;
+extern void bpf_rcu_read_unlock(void) __ksym;
 
 char _license[] SEC("license") = "GPL";
 
@@ -36,6 +38,18 @@ struct {
     __type(key, u32);
     __type(value, struct cake_stats);
 } stats_map SEC(".maps");
+
+/*
+ * Global Idle Count (Fail-Fast Optimization)
+ * Atomic counter of currently idle CPUs.
+ * Used to skip expensive search in select_cpu when 0.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} idle_stats_map SEC(".maps");
 
 static __always_inline struct cake_stats *get_local_stats(void)
 {
@@ -430,11 +444,40 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     }
 
+    /* 
+     * OPTIMIZATION: Fail-Fast Idle Check (Saturation)
+     * If NO CPUs are idle (count == 0), skip the 100-cycle search.
+     * We know it will fail. Just return prev_cpu (likely busy) 
+     * and let it queue to global DSQ.
+     */
+    u32 idle_key = 0;
+    u32 *idle_count = bpf_map_lookup_elem(&idle_stats_map, &idle_key);
+    if (idle_count && *idle_count == 0) {
+        /* No idle CPUs exists. Skip expensive LLC search. */
+        return prev_cpu;
+    }
+
     /* Track wake time for wait budget calculations (Store full u32) */
     tctx->last_wake_ts = (u32)now;
 
-    /* Try to find an idle CPU, prefer same LLC */
-    cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    /* 
+     * OPTIMIZATION: Sticky Fast Path (Cache Locality)
+     * If the previous CPU is idle, pick it immediately.
+     * Logic: Check if current task on prev_cpu is PID 0 (Idle/Swapper).
+     * Prevents game threads from hopping cores and losing L1/L2 cache.
+     */
+    if (prev_cpu >= 0) {
+        struct task_struct *curr = scx_bpf_cpu_curr(prev_cpu);
+        if (curr && curr->pid == 0) {
+            is_idle = true; 
+            cpu = prev_cpu;
+        } else {
+            /* Try to find an idle CPU, prefer same LLC */
+            cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+        }
+    } else {
+        cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    }
 
     /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
     if (is_idle) {
@@ -589,12 +632,12 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 {
     /*
      * Starvation protection: probabilistically let lower tiers run
-     * OPTIMIZATION: Use Pseudo-Random (PID + Slice) to avoid RDTSC overhead.
-     * Cost: 0 cycles (registers already loaded) vs 20-40 cycles (RDTSC).
-     * 0xF mask gives ~1/16 probability.
-     * VERIFIER FIX: Must check if prev is NULL before access.
+     * OPTIMIZATION: "Jitter Entropy" (0 Cycles)
+     * Use sum_exec_runtime (nanosecond precision) which captures natural
+     * system jitter (cache misses, interrupts).
+     * XOR with PID to scatter. Avoids helper overhead of prandom.
      */
-    if (prev && ((prev->pid + prev->scx.slice) & 0xF) == 0) {
+    if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
         /* Give background a chance even if others have work */
         if (scx_bpf_dsq_move_to_local(BACKGROUND_DSQ))
             return;
@@ -638,11 +681,12 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         
         /* 
          * OPTIMIZATION: Bitwise Decay on Long Sleep
-         * If task slept for > 100ms (100,000,000ns), decay its history.
-         * This helps heavy tasks that become interactive (e.g. VSCode) recover faster.
+         * If task slept for > 33ms (33,000,000ns), decay its history.
+         * Tuned for Gaming: 33ms is ~2 frames. Resets "heavy" stats faster
+         * for bursty threads (e.g. loading screens -> gameplay).
          * >> 1 is 50% decay (cheap 0-cycle logic vs Kalman reset).
          */
-        if (wait_time > 100000000) {
+        if (wait_time > 33000000) {
              tctx->avg_runtime_us >>= 1;
         }
 
@@ -804,6 +848,18 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
  *   Interactive: 20ms - Normal apps get more leeway
  *   Background:  50ms - Bulk work can run longer
  */
+void BPF_STRUCT_OPS(cake_update_idle, s32 cpu, bool idle)
+{
+    u32 key = 0;
+    u32 *val = bpf_map_lookup_elem(&idle_stats_map, &key);
+    if (val) {
+        if (idle)
+            __sync_fetch_and_add(val, 1);
+        else
+            __sync_fetch_and_add(val, -1);
+    }
+}
+
 void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 {
     struct cake_task_ctx *tctx;
@@ -856,6 +912,20 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
     /* BITWISE OPTIMIZATION: >> 10 (~ / 1024) instead of / 1000 */
     cached_threshold_ns = (quantum_ns * sparse_threshold) >> 10;
 
+    /* Initialize Idle Count (Correctness Sync) */
+    u32 nr_cpus = scx_bpf_nr_cpu_ids();
+    u32 count = 0;
+    /* Loop bounded for verifier (max 1024 CPUs) */
+    for (s32 i = 0; i < 1024; i++) {
+        if (i >= nr_cpus) break;
+        bpf_rcu_read_lock();
+        struct task_struct *p = scx_bpf_cpu_curr(i);
+        if (p && p->pid == 0) count++;
+        bpf_rcu_read_unlock();
+    }
+    u32 key = 0;
+    bpf_map_update_elem(&idle_stats_map, &key, &count, BPF_ANY);
+
     /* Create all 7 dispatch queues in priority order */
     ret = scx_bpf_create_dsq(CRITICAL_LATENCY_DSQ, -1);
     if (ret < 0)
@@ -902,8 +972,10 @@ SCX_OPS_DEFINE(cake_ops,
                .dispatch       = (void *)cake_dispatch,
                .running        = (void *)cake_running,
                .stopping       = (void *)cake_stopping,
+               .update_idle    = (void *)cake_update_idle,
                .tick           = (void *)cake_tick,
                .enable         = (void *)cake_enable,
                .init           = (void *)cake_init,
                .exit           = (void *)cake_exit,
+               .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,
                .name           = "cake");
