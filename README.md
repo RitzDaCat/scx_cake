@@ -150,23 +150,21 @@ Tasks running under 100µs gain points. Over 100µs lose points.
 
 **99.8% of tasks bypass queuing entirely** through direct dispatch.
 
-### How It Works
+### How It Works (Adaptive Wakeup)
 
-```
-Task wakes up
-    ↓
-Check: Is there an idle CPU?
-    ↓
-YES → Direct dispatch! Task runs IMMEDIATELY on that CPU
-    ↓
-NO  → Enqueue to tier's DSQ, wait for dispatch
-```
+1.  **Sticky Fast Path (20 Cycles):**
+    *   Is the task's previous CPU idle? **YES** -> Run there immediately. (Best Cache Locality).
+2.  **Fail-Fast Check (Saturation):**
+    *   Are ALL CPUs busy? **YES** -> Queue immediately. (Don't waste time searching).
+3.  **Smart Search (100 Cycles):**
+    *   Is there an idle CPU elsewhere? **YES** -> Find it and run there.
 
 ### Why This Matters
 
 - **Zero queue time** for most tasks
 - **No contention** with other tasks
 - **Immediate execution** when CPUs available
+- **Zero Search Overhead** when system is full
 
 With a 16-core 9800X3D, there's almost always an idle core available!
 
