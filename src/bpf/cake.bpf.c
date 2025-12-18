@@ -40,16 +40,32 @@ struct {
 } stats_map SEC(".maps");
 
 /*
- * Global Idle Count (Fail-Fast Optimization)
- * Atomic counter of currently idle CPUs.
- * Used to skip expensive search in select_cpu when 0.
+ * Global Idle Mask (Bitmask Optimization)
+ * Atomic bitmask of currently idle CPUs.
+ * Used for O(1) "CTZ" idle CPU finding.
+ * Replaces linear "Fail-Fast" count.
+ * OPTIMIZATION: BSS Global Variable (No Map Lookup Overhead)
  */
+u64 idle_mask SEC(".bss");
+
+/*
+ * Global CPU Tier Map (The "Scoreboard")
+ * Shared array allowing any CPU to see what Tier is running on any other CPU.
+ * Key: CPU ID
+ * Value: padded struct (to prevent False Sharing).
+ * Used for O(1) Zero-Cycle Victim Selection.
+ */
+struct cake_cpu_status {
+    u8 tier;
+    u8 __pad[63]; /* Pad to 64 bytes (Cache Line Size) to prevent False Sharing */
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 1024);
     __type(key, u32);
-    __type(value, u32);
-} idle_stats_map SEC(".maps");
+    __type(value, struct cake_cpu_status);
+} cpu_tier_map SEC(".maps");
 
 static __always_inline struct cake_stats *get_local_stats(void)
 {
@@ -60,8 +76,7 @@ static __always_inline struct cake_stats *get_local_stats(void)
 /* User exit info for graceful scheduler exit */
 UEI_DEFINE(uei);
 
-/* Global vtime for fair scheduling */
-static u64 vtime_now;
+/* Global vtime removed to prevent bus locking. Tasks inherit vtime from parent. */
 
 /* Optimization: Precomputed threshold to avoid division in hot path */
 static u64 cached_threshold_ns;
@@ -123,6 +138,7 @@ static const u32 tier_multiplier[8] = {
 #define THRESHOLD_INTERACTIVE 50   /* Score >= 50 → Interactive */
 #define THRESHOLD_BATCH       30   /* Score >= 30 → Batch */
 /* Below 30 → Background */
+#define CAKE_TIER_IDLE 255 /* Special value for Scoreboard (Cpu is Idle) */
 
 /*
  * CAKE-style wait budget per tier (nanoseconds)
@@ -184,18 +200,10 @@ static const u64 starvation_threshold[8] = {
 
 
 /*
- * Inverse weight table for vtime scaling (Nice -20 to +19)
- * Maps static_prio (100-139) to inverse factor.
- * Factor = (1024 * 65536) / sched_prio_to_weight[load]
- * Allows vtime = (slice * factor) >> 16
+ * Vtime Table Removed:
+ * FIFO DSQs do not use dsq_vtime for ordering.
+ * Removed 160 bytes of static data + 30 cycles of math.
  */
-static const u32 sched_prio_to_w_inv[40] = {
-    756, 935, 1188, 1450, 1849, 2301, 2885, 3587, 4489, 5631,
-    7028, 8806, 11001, 13684, 17180, 21502, 26832, 33706, 42313, 52551,
-    65536, /* Nice 0 */
-    81840, 102456, 127583, 158649, 200324, 246723, 312134, 390167, 489845,
-    610080, 771366, 958698, 1198372, 1491308, 1864135, 2314098, 2917776, 3728270, 4473924
-};
 
 /*
  * Per-task context map
@@ -210,13 +218,18 @@ struct {
 /*
  * Per-CPU preemption cooldown timestamp (ns)
  * Key: CPU ID
- * Value: Last time we forced a preemption on this CPU
+ * Value: Padded struct to prevent False Sharing (8 CPUs per cache line)
  */
+struct cake_cooldown_status {
+    u64 last_preempt_ts;
+    u8 __pad[56]; /* Pad to 64 bytes */
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1024); /* Support up to 1024 CPUs */
     __type(key, u32);
-    __type(value, u64);
+    __type(value, struct cake_cooldown_status);
 } preempt_cooldown SEC(".maps");
 
 
@@ -257,6 +270,7 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p)
         return NULL;
 
     /* Initialize 16-byte compressed fields */
+    ctx->next_slice = quantum_ns; /* Default slice */
     ctx->deficit_us = (u16)((quantum_ns + new_flow_bonus_ns) >> 10);
     ctx->last_run_at = 0;
     ctx->last_wake_ts = 0;
@@ -343,7 +357,23 @@ static __always_inline void update_kalman_estimate(struct cake_task_ctx *tctx, u
  *
  * OPTIMIZATION: Uses lookup table with latency gates for score=100.
  */
-static __always_inline u8 classify_tier(struct task_struct *p, struct cake_task_ctx *tctx)
+/*
+ * Update task tier based on sparse score and runtime (behavior-based)
+ * 
+ * Score ranges (7 tiers):
+ *   100 + <50µs avg:   CritLatency - True input handlers
+ *   100 + 50-500µs:    Realtime    - Fast sparse tasks (network IRQs)
+ *   90-100 (fallback): Critical    - High-priority sparse
+ *   70-89:  Gaming      - Sparse (game threads, UI)
+ *   50-69:  Interactive - Baseline (default applications)
+ *   30-49:  Batch       - Lower priority (nice > 0)
+ *   0-29:   Background  - Bulk (compilers, encoders)
+ *
+ * OPTIMIZATION: Zero-Cycle Wakeup
+ * We update the tier here (post-run) and store it in tctx.
+ * This allows 'cake_enqueue' to be a simple O(1) load.
+ */
+static __always_inline void update_task_tier(struct task_struct *p, struct cake_task_ctx *tctx)
 {
     u32 score = GET_SPARSE_SCORE(tctx);
     u32 avg_us = tctx->avg_runtime_us;
@@ -381,7 +411,20 @@ static __always_inline u8 classify_tier(struct task_struct *p, struct cake_task_
     /* tier 2 (Critical) -> tier 1 (Realtime) or tier 0 (CritLatency) */
     tier -= (adj & mask_gates);
     
-    return tier;
+    SET_TIER(tctx, tier);
+
+    /* 
+     * OPTIMIZATION: Zero-Cycle Slice Calculation
+     * Pre-compute the slice duration for the next wakeup.
+     * This moves all math (deficits, bonuses, multipliers) out of the hot path.
+     */
+    u64 deficit_ns = (u64)tctx->deficit_us << 10;
+    bool has_bonus = deficit_ns > quantum_ns;
+    s64 mask_bonus = -(s64)has_bonus;
+    u64 slice = (deficit_ns & mask_bonus) | (quantum_ns & ~mask_bonus);
+    
+    /* Apply tier multiplier and store */
+    tctx->next_slice = (slice * tier_multiplier[tier & 7]) >> 10;
 }
 
 /*
@@ -445,14 +488,23 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     /* 
-     * OPTIMIZATION: Fail-Fast Idle Check (Saturation)
-     * If NO CPUs are idle (count == 0), skip the 100-cycle search.
-     * We know it will fail. Just return prev_cpu (likely busy) 
-     * and let it queue to global DSQ.
+     * OPTIMIZATION: Fail-Fast & Zero-Cycle Idle Search (Bitmask)
+     * We use a global 64-bit mask where set bits = idle CPUs.
+     * 1. Check `mask == 0` (Saturation Check) - Cost: 1 Load, 1 Cmp.
+     * 2. Find `ctz(mask)` (Idle CPU) - Cost: 1 Instruction.
      */
-    u32 idle_key = 0;
-    u32 *idle_count = bpf_map_lookup_elem(&idle_stats_map, &idle_key);
-    if (idle_count && *idle_count == 0) {
+    /* 
+     * OPTIMIZATION: Fail-Fast & Zero-Cycle Idle Search (Global Bitmask)
+     * We use a global 64-bit mask where set bits = idle CPUs.
+     * 1. Check `mask == 0` (Saturation Check) - Cost: 1 Load (Direct), 1 Cmp.
+     * 2. Find `ctz(mask)` (Idle CPU) - Cost: 1 Instruction.
+     */
+    /* No map lookup needed - direct global access */
+    
+    /* Move tier read up for the check */
+    u8 tier = GET_TIER(tctx);
+    
+    if (idle_mask == 0 && tier > REALTIME_DSQ) {
         /* No idle CPUs exists. Skip expensive LLC search. */
         return prev_cpu;
     }
@@ -461,22 +513,50 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     tctx->last_wake_ts = (u32)now;
 
     /* 
-     * OPTIMIZATION: Sticky Fast Path (Cache Locality)
-     * If the previous CPU is idle, pick it immediately.
-     * Logic: Check if current task on prev_cpu is PID 0 (Idle/Swapper).
-     * Prevents game threads from hopping cores and losing L1/L2 cache.
+     * OPTIMIZATION: Smart Bypass (Cycle Saver)
+     * If we know the system is saturated (idle_mask == 0),
+     * searching is wasteful. Tier 0/1 fall through to here.
      */
-    if (prev_cpu >= 0) {
-        struct task_struct *curr = scx_bpf_cpu_curr(prev_cpu);
-        if (curr && curr->pid == 0) {
-            is_idle = true; 
-            cpu = prev_cpu;
-        } else {
-            /* Try to find an idle CPU, prefer same LLC */
-            cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-        }
+    bool saturated = (idle_mask == 0);
+
+    if (saturated) {
+        cpu = prev_cpu;
+        is_idle = false;
     } else {
-        cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+        /* 
+         * OPTIMIZATION: Bitmask Idle Find (O(1))
+         * Instead of scanning neighbors or walking lists, we just
+         * find the first set bit in the mask.
+         * 
+         * We prefer the previous CPU if it is in the mask (Sticky).
+         */
+        
+        /* Step 1: Check Sticky/Prev CPU */
+        bool prev_is_idle = false;
+        if (prev_cpu >= 0 && prev_cpu < 64) {
+             if (idle_mask & (1ULL << prev_cpu)) {
+                 is_idle = true;
+                 cpu = prev_cpu;
+                 prev_is_idle = true;
+             }
+        }
+        
+        if (!prev_is_idle) {
+            /* 
+             * Step 2: Instant Idle Find
+             * __builtin_ctzll finds the index of the first ls-bit.
+             * This finds the lowest ID idle CPU in O(1).
+             * Direct load from global variable.
+             */
+            u64 mask = idle_mask;
+            if (mask) {
+                cpu = __builtin_ctzll(mask);
+                is_idle = true;
+            } else {
+                 /* Racing condition: mask became 0 between check and load */
+                 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+            }
+        }
     }
 
     /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
@@ -495,25 +575,79 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
      * If we didn't find an idle CPU, but this is a latency-sensitive task,
      * check if the target CPU is running something low priority.
      */
-    if (GET_SPARSE_SCORE(tctx) >= 100) {
-        struct task_struct *curr = scx_bpf_cpu_curr(cpu);
-        struct cake_task_ctx *curr_ctx = get_task_ctx(curr);
+    /* tier already read above */
+    /* 
+     * Preemption Injection
+     * If we didn't find an idle CPU, but this is a latency-sensitive task,
+     * check if the target CPU is running something low priority.
+     */
+    /* tier already read above */
+    if (tier <= REALTIME_DSQ) { // Tier 0 (CritLatency) or Tier 1 (Realtime)
+        /* 
+         * OPTIMIZATION: Smart Victim Selection
+         * Instead of blindly picking prev_cpu, scan neighbors (likely LLC/CCD)
+         * to find a lower priority victim.
+         * 
+         * Scan window: 4 CPUs (prev, +1, +2, +3).
+         * Cost: 4 * 20 cycles = ~80 cycles.
+         * Benefit: Avoids blindly killing a Game Thread if a Background task is nearby.
+         */
+        s32 best_cpu = -1;
+        u8 max_victim_tier = 0;
         
-        /* If current task is Interactive, Batch or Background, it's a valid victim */
-        if (curr_ctx && GET_TIER(curr_ctx) >= CAKE_TIER_INTERACTIVE) {
-            u32 cpu_key = cpu;
-            u64 *last_preempt;
+        int victim_threshold = (tier == CRITICAL_LATENCY_DSQ) ? GAMING_DSQ : INTERACTIVE_DSQ;
+        u32 nr_cpus = scx_bpf_nr_cpu_ids();
+
+        /* Bound loop for verifier */
+        for (u32 i = 0; i < 4; i++) {
+            /* Simple stride search */
+            s32 cand_cpu = (prev_cpu + i);
+            if (cand_cpu >= nr_cpus) cand_cpu -= nr_cpus;
             
-            last_preempt = bpf_map_lookup_elem(&preempt_cooldown, &cpu_key);
-            if (last_preempt) {
-                if (now - *last_preempt > 50000) {
-                    *last_preempt = now;
-                    scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+            /* Zero-Cycle Lookup: Read from Scoreboard */
+            u32 cand_key = cand_cpu;
+            struct cake_cpu_status *cand_status = bpf_map_lookup_elem(&cpu_tier_map, &cand_key);
+            
+            if (cand_status) {
+                u8 curr_tier = cand_status->tier;
+                
+                /* Found a valid victim? */
+                if (curr_tier >= victim_threshold) {
+                    /* Is this the "worst" (best victim) one we've seen? */
+                    if (curr_tier >= max_victim_tier) {
+                        max_victim_tier = curr_tier;
+                        best_cpu = cand_cpu;
+                        
+                        /* Optimization: If we found a Background task (max tier), stop looking. */
+                        if (max_victim_tier == BACKGROUND_DSQ) break;
+                    }
+                }
+            }
+        }
+        
+        /* Did we find a victim? */
+        /* Did we find a victim? */
+        if (best_cpu >= 0) {
+            u32 cpu_key = best_cpu;
+            struct cake_cooldown_status *cooldown;
+            
+            cooldown = bpf_map_lookup_elem(&preempt_cooldown, &cpu_key);
+            if (cooldown) {
+                if (now - cooldown->last_preempt_ts > 50000) {
+                    cooldown->last_preempt_ts = now;
+                    scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
                     
                     if (enable_stats) {
                         struct cake_stats *s = get_local_stats();
                         if (s) s->nr_input_preempts++;
                     }
+                    /* 
+                     * but we are returning 'cpu' from this function.
+                     * If we are in 'saturation' bypass mode, 'cpu' is set to 'prev_cpu'.
+                     * 
+                     * Let's update 'cpu' to 'best_cpu' so we try to enqueue locally there!
+                     */
+                    cpu = best_cpu;
                 }
             }
         }
@@ -538,9 +672,8 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
-    /* Classify tier */
-    tier = classify_tier(p, tctx);
-    SET_TIER(tctx, tier);
+    /* Zero-Cycle Wakeup: Tier already calculated in cake_stopping */
+    tier = GET_TIER(tctx);
 
     /* Track if this is a wakeup (new flow) or preemption (old flow) */
     /* Track if this is a wakeup (new flow) or preemption (old flow) */
@@ -582,29 +715,11 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     dsq_id = tier;
 
     /*
-     * OPTIMIZATION: New flow bonus via slice adjustment
-     * New flows have higher deficit (quantum + bonus), so give them
-     * a longer initial slice. This effectively prioritizes them without
-     * needing vtime/PRIQ ordering.
+     * OPTIMIZATION: Zero-Cycle Slice (Pre-Computed)
+     * All the complex deficit/bonus/multiplier logic was done in cake_stopping.
+     * Now we just load the result. 15 cycles -> 0 cycles.
      */
-    /*
-     * OPTIMIZATION: Branchless New Flow Bonus
-     * Use bitwise mask to select larger of quantum or deficit.
-     * Conversion: deficit_us << 10 to get approx nanoseconds
-     */
-    u64 deficit_ns = (u64)tctx->deficit_us << 10;
-    bool has_bonus = deficit_ns > quantum_ns;
-    s64 mask_bonus = -(s64)has_bonus;
-    u64 slice = (deficit_ns & mask_bonus) | (quantum_ns & ~mask_bonus);
-
-    /*
-     * Apply tier-based quantum multiplier
-     * Higher tiers get SMALLER slices (more responsive)
-     * Lower tiers get LARGER slices (less context switching)
-     */
-    /* OPTIMIZATION: Unconditional fixed-point math (>> 10) */
-    /* Access safe: tier_multiplier is padded to 8, (tier & 7) is 0-7 */
-    slice = (slice * tier_multiplier[tier & 7]) >> 10;
+    u64 slice = tctx->next_slice;
 
     scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
 }
@@ -673,6 +788,16 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     if (unlikely(!tctx))
         return;
 
+    /* 
+     * OPTIMIZATION: Scoreboard Update (Global Awareness)
+     * Publish this task's tier to the global map.
+     * Allows neighbors to check our status in O(1).
+     */
+    u8 tier = GET_TIER(tctx);
+    u32 cpu_key = scx_bpf_task_cpu(p);
+    struct cake_cpu_status status = { .tier = tier };
+    bpf_map_update_elem(&cpu_tier_map, &cpu_key, &status, BPF_ANY);
+
     /* WAIT BUDGET CHECK (CAKE AQM) */
     if (tctx->last_wake_ts > 0) {
         u32 now_ts = (u32)now;
@@ -690,7 +815,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
              tctx->avg_runtime_us >>= 1;
         }
 
-        u8 tier = GET_TIER(tctx);
+        /* Tier read moved up for scoreboard */
         
         /* Global and per-tier stats (only when stats enabled) */
         if (enable_stats) {
@@ -721,10 +846,6 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         
         checks++;
         
-        /* 
-         * Check budget:
-         * Critical: 500us, Gaming: 2ms, Interactive: 10ms
-         */
         /* 
          * Check budget:
          * Critical: 500us, Gaming: 2ms, Interactive: 10ms
@@ -778,9 +899,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     tctx->last_run_at = (u32)now;
 
 
-    /* Update global vtime */
-    if (time_before(vtime_now, p->scx.dsq_vtime))
-        vtime_now = p->scx.dsq_vtime;
+    /* Update global vtime - REMOVED (Local Inheritance Model) */
 }
 
 /*
@@ -807,28 +926,18 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
     /* Update sparse score - this determines Gaming vs Normal DSQ */
     update_sparse_score(tctx, runtime);
 
-    /* Charge vtime based on runtime and weight */
-    /* Charge vtime based on runtime and weight */
-    if (likely(p->scx.weight == 100)) {
-        /* Optimization: Standard weight (nice 0) - avoid division */
-        p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice);
-    } else {
-        /* 
-         * OPTIMIZATION: Bitwise vtime scaling
-         * Use static_prio to lookup pre-calculated inverse weight.
-         * Maps pure integer math (>> 16) instead of division.
-         */
-        int idx = p->static_prio - 100;
-        
-        /* Clamp index to valid range (0-39) */
-        if (idx < 0) idx = 0;
-        else if (idx > 39) idx = 39;
-        
-        u64 inv_weight = sched_prio_to_w_inv[idx];
-        u64 delta = SCX_SLICE_DFL - p->scx.slice;
-        
-        p->scx.dsq_vtime += (delta * inv_weight) >> 16;
-    }
+    /* 
+     * OPTIMIZATION: Calc Tier for Next Wakeup (Zero-Cycle Enqueue)
+     * We calculate the tier NOW (while data is hot in L1) and save it.
+     * When this task wakes up later, it can just read the result.
+     */
+    update_task_tier(p, tctx);
+
+    /* 
+     * OPTIMIZATION: Removed Dead Vtime Code
+     * Since we use FIFO queues, updating p->scx.dsq_vtime has NO EFFECT.
+     * Saved ~30 cycles of pointless math.
+     */
 
     /* Update deficit (us) */
     /* deficit is u16 (us), runtime is u64 (ns). Convert runtime to us (>> 10) */
@@ -850,13 +959,30 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
  */
 void BPF_STRUCT_OPS(cake_update_idle, s32 cpu, bool idle)
 {
-    u32 key = 0;
-    u32 *val = bpf_map_lookup_elem(&idle_stats_map, &key);
-    if (val) {
-        if (idle)
-            __sync_fetch_and_add(val, 1);
-        else
-            __sync_fetch_and_add(val, -1);
+    /* Cap CPU ID to 63 for 64-bit mask safety */
+    if (cpu >= 0 && cpu < 64) {
+         u64 bit = (1ULL << cpu);
+         if (idle) {
+             /* Mark as Idle (Set Bit - Direct Global) */
+             __sync_fetch_and_or(&idle_mask, bit);
+             
+             /* 
+              * OPTIMIZATION: Scoreboard Idle Update
+              * Mark this CPU as IDLE in the global map.
+              * Allows neighbors to "Instant Find" this idle CPU.
+              */
+             u32 cpu_key = cpu;
+             struct cake_cpu_status status = { .tier = CAKE_TIER_IDLE };
+             bpf_map_update_elem(&cpu_tier_map, &cpu_key, &status, BPF_ANY);
+         } else {
+             /* Mark as Busy (Clear Bit - Direct Global) */
+             __sync_fetch_and_and(&idle_mask, ~bit);
+             
+             /* 
+              * Note: we don't clear the tier map here. 
+              * cake_running will overwrite it.
+              */
+         }
     }
 }
 
@@ -898,8 +1024,23 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
  */
 void BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
 {
-    /* Initialize task's vtime to current global vtime */
-    p->scx.dsq_vtime = vtime_now;
+    /* 
+     * Vtime inheritance removed: Unused in FIFO mode.
+     */
+}
+
+/*
+ * Task is disabled (leaving sched_ext)
+ */
+void BPF_STRUCT_OPS(cake_disable, struct task_struct *p)
+{
+    /* 
+     * Cleanup Task Storage
+     * When a task leaves scx_cake (e.g. exit or switch to CFS), we must
+     * explicitly delete its task storage to prevent memory leaks.
+     * Use BPF helper which is faster than waiting for task rcu death.
+     */
+    bpf_task_storage_delete(&task_ctx, p);
 }
 
 /*
@@ -912,19 +1053,20 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
     /* BITWISE OPTIMIZATION: >> 10 (~ / 1024) instead of / 1000 */
     cached_threshold_ns = (quantum_ns * sparse_threshold) >> 10;
 
-    /* Initialize Idle Count (Correctness Sync) */
+    /* Initialize Idle Mask (Correctness Sync) */
     u32 nr_cpus = scx_bpf_nr_cpu_ids();
-    u32 count = 0;
-    /* Loop bounded for verifier (max 1024 CPUs) */
-    for (s32 i = 0; i < 1024; i++) {
+    u64 init_mask = 0;
+    /* Loop bounded for verifier (max 64 CPUs for mask) */
+    for (s32 i = 0; i < 64; i++) {
         if (i >= nr_cpus) break;
         bpf_rcu_read_lock();
         struct task_struct *p = scx_bpf_cpu_curr(i);
-        if (p && p->pid == 0) count++;
+        /* If idle task is running, set the bit */
+        if (p && p->pid == 0) init_mask |= (1ULL << i);
         bpf_rcu_read_unlock();
     }
-    u32 key = 0;
-    bpf_map_update_elem(&idle_stats_map, &key, &count, BPF_ANY);
+    /* Direct assignment to global (no concurrency on init) */
+    idle_mask = init_mask;
 
     /* Create all 7 dispatch queues in priority order */
     ret = scx_bpf_create_dsq(CRITICAL_LATENCY_DSQ, -1);
@@ -973,8 +1115,9 @@ SCX_OPS_DEFINE(cake_ops,
                .running        = (void *)cake_running,
                .stopping       = (void *)cake_stopping,
                .update_idle    = (void *)cake_update_idle,
-               .tick           = (void *)cake_tick,
+                .tick           = (void *)cake_tick,
                .enable         = (void *)cake_enable,
+               .disable        = (void *)cake_disable,
                .init           = (void *)cake_init,
                .exit           = (void *)cake_exit,
                .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,

@@ -63,6 +63,7 @@ enum cake_flow_flags {
  * - Info: Packed into single u32 bitfield.
  */
 struct cake_task_ctx {
+    u64 next_slice;        /* 8B: OPTIMIZATION: Pre-computed slice (ns) */
     u32 last_run_at;       /* 4B: Last run (ns), wraps 4.2s */
     u32 last_wake_ts;      /* 4B: NEW: Wake TS (ns), wraps 4.2s */
     u32 packed_info;       /* 4B: Bitfield (Err, Wait, Score, Tier, Flags) */
