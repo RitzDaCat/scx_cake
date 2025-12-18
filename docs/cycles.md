@@ -53,14 +53,16 @@ Counts are estimates based on BPF instruction complexity (x86_64 JIT).
 
 ## 3. `cake_select_cpu` (Wakeup Decision)
 **Frequency:** High
-**Optimization:** **Scoreboard O(1)**
+**Optimization:** **Global Bitmask O(1)**
 
 | Operation | Type | Cost (Cycles) | Notes |
 | :--- | :--- | :--- | :--- |
-| `get_task_ctx` | Map | 20 | |
-| Scoreboard Lookup | **L1 Load** | **5** | O(1) Array Read (Padded) |
-| Scoreboard Scan | **L1 Load** | **~20** | Scan 4-8 Neighbors (Loop) |
-| **Total Overhead** | | **~45** | **Kernel Search Bypassed** |
+| `scx_bpf_cpu_curr` | Helper | ~0 | Inherited Context |
+| Global Mask Load | **L1 Load** | **2** | `idle_mask` (Direct .bss access) |
+| `__builtin_ctzll` | **ALU** | **1** | Hardware Instruction (TZCNT) |
+| **Total Overhead** | | **~5** | **Hardware Limit** |
+
+*Note: If no CPU is idle in the mask, we fall back to the Neighbor Scoreboard (~20c), but this path is rare under 90% load.*
 
 ## 4. `cake_stopping` (Accounting & Pre-Calc)
 **Frequency:** High (Context Switch)
