@@ -605,8 +605,11 @@ The optimizations in `scx_cake` are informed by high-performance computing resea
 
 #### Arc Raiders - Best Run (December 2025)
 
+**Test Location**: Firing Range → Weapon Bench → Crosshair aimed at 40m marker
+
 | Metric | Value |
 |:-------|:------|
+| **Resolution** | 4K (3840x2160) |
 | **1% Low FPS** | **233 FPS** |
 | **Average Frametime** | 3.8ms |
 | **1% Best Frametime** | 3.63ms |
