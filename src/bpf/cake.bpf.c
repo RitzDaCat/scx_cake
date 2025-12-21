@@ -26,7 +26,6 @@ const volatile u64 quantum_ns = CAKE_DEFAULT_QUANTUM_NS;
 const volatile u64 new_flow_bonus_ns = CAKE_DEFAULT_NEW_FLOW_BONUS_NS;
 const volatile u64 sparse_threshold = CAKE_DEFAULT_SPARSE_THRESHOLD;
 const volatile u64 starvation_ns = CAKE_DEFAULT_STARVATION_NS;
-const volatile bool debug = false;
 const volatile bool enable_stats = false;  /* Set to true when --verbose is used */
 
 /*
@@ -47,6 +46,15 @@ struct {
  * OPTIMIZATION: BSS Global Variable (No Map Lookup Overhead)
  */
 u64 idle_mask SEC(".bss");
+
+/*
+ * OPTIMIZATION: Cache Line Padding
+ * Prevents false sharing between idle_mask and victim_mask.
+ * On multi-core systems, atomic updates to adjacent variables cause
+ * cross-core cache line invalidation. 56 bytes padding ensures
+ * they reside in separate 64-byte cache lines.
+ */
+u64 __mask_pad[7] SEC(".bss");
 
 /*
  * Global Victim Mask (O(1) Victim Selection)
@@ -89,9 +97,6 @@ UEI_DEFINE(uei);
 /* Optimization: Precomputed threshold to avoid division in hot path */
 static u64 cached_threshold_ns;
 
-/* Optimization: Cached CPU count to avoid kernel helper calls in hot path */
-static u32 cached_nr_cpus;
-
 
 
 /*
@@ -129,21 +134,8 @@ static const u32 tier_multiplier[8] = {
     1024,  /* PADDING: Entry 7 (Unused/Safe) */
 };
 
-/* Sparse score thresholds for tier classification (0-100)
- * Each tier is determined by the sparse score range:
- * - 100:    Realtime (perfect sparse score only)
- * - 90-99:  Critical (ultra-sparse, input handlers)
- * - 70-89:  Gaming (sparse, interactive)
- * - 50-69:  Interactive (normal applications)
- * - 30-49:  Batch (lower priority)
- * - 0-29:   Background (bulk/heavy CPU users)
- */
-#define THRESHOLD_REALTIME    100  /* Score == 100 → Realtime */
-#define THRESHOLD_CRITICAL    90   /* Score >= 90 → Critical */
-#define THRESHOLD_GAMING      70   /* Score >= 70 → Gaming */
-#define THRESHOLD_INTERACTIVE 50   /* Score >= 50 → Interactive */
-#define THRESHOLD_BATCH       30   /* Score >= 30 → Batch */
-/* Below 30 → Background */
+/* Sparse score thresholds for tier classification (0-100) */
+#define THRESHOLD_GAMING      70   /* Score >= 70 → Gaming (only threshold actively used) */
 #define CAKE_TIER_IDLE 255 /* Special value for Scoreboard (Cpu is Idle) */
 
 /*
@@ -159,7 +151,6 @@ static const u32 tier_multiplier[8] = {
 #define WAIT_BUDGET_GAMING      4000000   /* 4ms */
 #define WAIT_BUDGET_INTERACTIVE 8000000   /* 8ms */
 #define WAIT_BUDGET_BATCH       20000000  /* 20ms */
-#define WAIT_VIOLATIONS_DEMOTE  4         /* Demote after N consecutive violations */
 
 /* Array for O(1) wait budget lookup. PADDED TO 8 for Branchless Access (tier & 7). */
 static const u64 wait_budget[8] = {
@@ -236,11 +227,9 @@ struct {
 
 
 /*
- * Bitfield Accessor Macros for 16-byte struct
- * These allow us to pack 5 variables into a single u32.
+ * Bitfield Accessor Macros for packed_info
+ * These allow us to pack multiple variables into a single u32.
  */
-#define GET_KALMAN_ERROR(ctx) ((ctx->packed_info >> SHIFT_KALMAN_ERROR) & MASK_KALMAN_ERROR)
-#define SET_KALMAN_ERROR(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_KALMAN_ERROR << SHIFT_KALMAN_ERROR)) | ((val & MASK_KALMAN_ERROR) << SHIFT_KALMAN_ERROR))
 
 #define GET_WAIT_DATA(ctx) ((ctx->packed_info >> SHIFT_WAIT_DATA) & MASK_WAIT_DATA)
 #define SET_WAIT_DATA(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_WAIT_DATA << SHIFT_WAIT_DATA)) | ((val & MASK_WAIT_DATA) << SHIFT_WAIT_DATA))
@@ -250,9 +239,6 @@ struct {
 
 #define GET_TIER(ctx) ((ctx->packed_info >> SHIFT_TIER) & MASK_TIER)
 #define SET_TIER(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_TIER << SHIFT_TIER)) | ((val & MASK_TIER) << SHIFT_TIER))
-
-#define GET_FLAGS(ctx) ((ctx->packed_info >> SHIFT_FLAGS) & MASK_FLAGS)
-#define SET_FLAGS(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_FLAGS << SHIFT_FLAGS)) | ((val & MASK_FLAGS) << SHIFT_FLAGS))
 
 /*
  * Get or initialize task context
@@ -271,7 +257,7 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p)
     if (!ctx)
         return NULL;
 
-    /* Initialize 16-byte compressed fields */
+    /* Initialize task context fields */
     ctx->next_slice = quantum_ns; /* Default slice */
     ctx->deficit_us = (u16)((quantum_ns + new_flow_bonus_ns) >> 10);
     ctx->last_run_at = 0;
@@ -471,20 +457,19 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     /* Move tier read up for the check */
     u8 tier = GET_TIER(tctx);
     
+    /*
+     * FIX: Capture timestamp BEFORE fail-fast to ensure last_wake_ts is always set.
+     * The wait budget system in cake_running relies on last_wake_ts > 0.
+     * Previously, the early exit path skipped this, breaking tier demotion logic.
+     * OPTIMIZATION: scx_bpf_now() uses cached rq->clock instead of TSC read.
+     */
+    u64 now = scx_bpf_now();
+    tctx->last_wake_ts = (u32)now;
+    
     if (mask == 0 && tier > REALTIME_DSQ) {
         /* No idle CPUs exists. Skip expensive LLC search. */
         return prev_cpu;
     }
-
-    /* 
-     * OPTIMIZATION: Deferred Time Read
-     * Only call bpf_ktime_get_ns() AFTER fail-fast check.
-     * Saves 25 cycles on early exit path (~5% of wakeups).
-     */
-    u64 now = bpf_ktime_get_ns();
-
-    /* Track wake time for wait budget calculations (Store full u32) */
-    tctx->last_wake_ts = (u32)now;
 
     /* 
      * OPTIMIZATION: Smart Bypass (Cycle Saver)
@@ -727,7 +712,8 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 {
     struct cake_task_ctx *tctx;
-    u64 now = bpf_ktime_get_ns();
+    /* OPTIMIZATION: scx_bpf_now() uses cached rq->clock (~3-5 cycles vs ~15-25 for TSC) */
+    u64 now = scx_bpf_now();
 
     tctx = get_task_ctx(p);
     if (unlikely(!tctx))
@@ -856,9 +842,6 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     }
 
     tctx->last_run_at = (u32)now;
-
-
-    /* Update global vtime - REMOVED (Local Inheritance Model) */
 }
 
 /*
@@ -867,7 +850,8 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 {
     struct cake_task_ctx *tctx;
-    u64 now = bpf_ktime_get_ns();
+    /* OPTIMIZATION: scx_bpf_now() uses cached rq->clock */
+    u64 now = scx_bpf_now();
     u64 runtime;
 
     tctx = get_task_ctx(p);
@@ -925,17 +909,12 @@ void BPF_STRUCT_OPS(cake_update_idle, s32 cpu, bool idle)
              /* Mark as Idle (Set Bit - Direct Global) */
              __sync_fetch_and_or(&idle_mask, bit);
              
-             /* Clear from victim mask - idle CPUs are not victims */
-             __sync_fetch_and_and(&victim_mask, ~bit);
-             
              /* 
-              * OPTIMIZATION: Scoreboard Idle Update
-              * Mark this CPU as IDLE in the global map.
-              * Allows neighbors to "Instant Find" this idle CPU.
+              * Note: we don't update victim_mask or scoreboard here.
+              * - idle_mask is the primary mechanism for finding idle CPUs
+              * - cake_running will update scoreboard when task starts
+              * - Saves ~40 cycles per idle transition
               */
-             u32 cpu_key = cpu;
-             struct cake_cpu_status status = { .tier = CAKE_TIER_IDLE };
-             bpf_map_update_elem(&cpu_tier_map, &cpu_key, &status, BPF_ANY);
          } else {
              /* Mark as Busy (Clear Bit - Direct Global) */
              __sync_fetch_and_and(&idle_mask, ~bit);
@@ -960,7 +939,8 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
     if (tctx->last_run_at > 0) {    /* Check for starvation */
         /* Use u32 wrap-safe math: (u32)now - last_run_at */
         /* Only valid if we ran within 4 seconds, otherwise we assume starvation anyway */
-        u32 runtime_32 = (u32)bpf_ktime_get_ns() - tctx->last_run_at;
+        /* OPTIMIZATION: scx_bpf_now() uses cached rq->clock */
+        u32 runtime_32 = (u32)scx_bpf_now() - tctx->last_run_at;
         u64 runtime = (u64)runtime_32;
 
         u8 tier = GET_TIER(tctx);
@@ -986,9 +966,7 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
  */
 void BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
 {
-    /* 
-     * Vtime inheritance removed: Unused in FIFO mode.
-     */
+    /* No initialization needed - context created on first use */
 }
 
 /*
@@ -1014,9 +992,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
 
     /* BITWISE OPTIMIZATION: >> 10 (~ / 1024) instead of / 1000 */
     cached_threshold_ns = (quantum_ns * sparse_threshold) >> 10;
-
-    /* Cache CPU count (invariant during scheduler lifetime) */
-    cached_nr_cpus = scx_bpf_nr_cpu_ids();
 
     /* Initialize Idle Mask (Correctness Sync) */
     u32 nr_cpus = scx_bpf_nr_cpu_ids();

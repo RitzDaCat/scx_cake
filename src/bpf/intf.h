@@ -45,18 +45,15 @@ enum cake_tier {
 };
 
 /*
- * Flow state flags
+ * Flow state flags (only CAKE_FLOW_NEW currently used)
  */
 enum cake_flow_flags {
-    CAKE_FLOW_NEW          = 1 << 0,  /* Task is in new-flow list */
-    CAKE_FLOW_SPARSE       = 1 << 1,  /* Task is sparse (low CPU usage) */
-    CAKE_FLOW_BOOSTED      = 1 << 2,  /* Manually boosted (e.g., gaming PID) */
-    CAKE_FLOW_INPUT_ACTIVE = 1 << 3,  /* Currently processing input events */
+    CAKE_FLOW_NEW = 1 << 0,  /* Task is newly created */
 };
 
 /*
- * Per-task flow state tracked in BPF (16 bytes - Quad Density)
- * Fits 4 contexts per 64-byte cache line.
+ * Per-task flow state tracked in BPF (24 bytes)
+ * Fits 2-3 contexts per 64-byte cache line.
  * 
  * COMPRESSION:
  * - Timestamps: u32 (Wraps every 4.2s) - Acceptable for active gaming.
@@ -107,27 +104,10 @@ struct cake_stats {
     u64 nr_input_preempts;                 /* Preemptions injected for input/latency */
 };
 
-/*
- * Configuration passed from userspace to BPF
- */
-struct cake_config {
-    u64 quantum_ns;        /* Base scheduling quantum (ns) */
-    u64 new_flow_bonus_ns; /* Extra time for new flows (ns) */
-    u64 sparse_threshold;  /* CPU usage threshold for sparse (permille, 0-1000) */
-    u64 starvation_ns;     /* Maximum time before forcing dispatch */
-};
-
 /* Default values */
 #define CAKE_DEFAULT_QUANTUM_NS         (4 * 1000 * 1000)   /* 4ms */
 #define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)   /* 8ms */
 #define CAKE_DEFAULT_SPARSE_THRESHOLD   100                  /* 10% = 100 permille */
 #define CAKE_DEFAULT_STARVATION_NS      (100 * 1000 * 1000) /* 100ms */
-
-/* DSQ IDs - per tier, with new/old flow variants */
-#define CAKE_DSQ_NEW_BASE   0x100
-#define CAKE_DSQ_OLD_BASE   0x200
-
-#define CAKE_DSQ_NEW(tier)  (CAKE_DSQ_NEW_BASE + (tier))
-#define CAKE_DSQ_OLD(tier)  (CAKE_DSQ_OLD_BASE + (tier))
 
 #endif /* __CAKE_INTF_H */

@@ -61,10 +61,6 @@ struct Args {
     /// Statistics update interval in seconds
     #[arg(long, default_value_t = 1)]
     interval: u64,
-
-    /// Enable debug output in BPF
-    #[arg(long)]
-    debug: bool,
 }
 
 struct Scheduler<'a> {
@@ -89,7 +85,6 @@ impl<'a> Scheduler<'a> {
             rodata.new_flow_bonus_ns = args.new_flow_bonus * 1000;
             rodata.sparse_threshold = args.sparse_threshold;
             rodata.starvation_ns = args.starvation * 1000;
-            rodata.debug = args.debug;
             rodata.enable_stats = args.verbose;  // Only collect stats when --verbose is used
         }
 
