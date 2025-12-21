@@ -76,7 +76,7 @@ Unfairness requires policing. If an Input task is allowed to run forever, it wil
 *   **Cost**: ~60 cycles → **5 cycles** per idle transition
 
 ### C. Cache Line Isolation
-**Problem**: `idle_mask` and `victim_mask` were adjacent in `.bss`, causing cache line thrashing on 24-core systems.
+**Problem**: `idle_mask` and `victim_mask` were adjacent in `.bss`, causing cache line thrashing on multi-core systems.
 **Solution**: Added 56-byte padding (`__mask_pad[7]`) between them.
 *   **Result**: Prevents false sharing between atomic updates
 
