@@ -46,6 +46,7 @@
    - [C. The "1% Low" Regression (Case Study)](#c-the-1-low-regression-case-study)
    - [D. The "FPS Overshoot" Phenomenon](#d-the-fps-overshoot-phenomenon)
    - [E. Performance Baseline](#e-performance-baseline)
+   - [F. Benchmarking](#f-benchmarking)
 
 7. [Usage](#7-usage)
    - [Quick Start](#quick-start)
@@ -67,6 +68,11 @@ Quick reference for technical terms used throughout this document.
 | **BPF / eBPF** | Extended Berkeley Packet Filter - a technology allowing sandboxed programs to run in kernel space without modifying kernel source |
 | **sched_ext** | Linux kernel framework (6.12+) that allows custom CPU schedulers to be implemented as BPF programs |
 | **DSQ** | Dispatch Queue - a holding queue where tasks wait before being assigned to a CPU |
+| **Tier** | Priority level (0-6) assigned to tasks based on behavior; determines quantum, preemption rights, and demotion thresholds |
+| **Quantum** | Base timeslice given to a task; default 2ms. Higher tiers get shorter slices (more preemption points) |
+| **Slice Multiplier** | Per-tier factor applied to quantum; e.g., 0.7x for Tier 0 means 1.4ms slice at 2ms quantum |
+| **Wait Budget** | Max time a task can wait in queue before being considered for demotion; prevents queue bloat |
+| **Starvation Limit** | Max runtime before forced preemption; safety net for runaway tasks |
 | **TZCNT** | "Trailing Zero Count" - x86 hardware instruction (`__builtin_ctzll`) that finds the first set bit in O(1) time |
 | **TSC** | Time Stamp Counter - hardware register counting CPU cycles; reading it costs ~15-25 cycles |
 | **rq->clock** | Cached timestamp on each CPU's run queue; cheaper to read than TSC (~3-5 cycles) |
@@ -87,7 +93,7 @@ Quick reference for technical terms used throughout this document.
 | **SMT** | Simultaneous Multi-Threading (Hyperthreading); 2 threads share one physical core |
 | **NUMA** | Non-Uniform Memory Access; memory access time varies by which CPU socket owns the RAM |
 | **IPC** | Instructions Per Cycle; measure of CPU efficiency (higher = better) |
-| **Kalman Filter** | Statistical algorithm for estimating values from noisy data; used for runtime prediction |
+| **EMA** | Exponential Moving Average - lightweight runtime estimator: `new_avg = (old_avg * 7 + sample) >> 3`. Replaced Kalman filter (too CPU-heavy) |
 
 ---
 
@@ -200,28 +206,115 @@ scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, SCX_ENQ_LAST);
 
 ## 3. The 7-Tier Priority System
 
-Tasks are classified by **Behavior**, not "Niceness". The tier determines both the timeslice and how aggressively the task can preempt others.
+Tasks are classified by **Behavior**, not "Niceness". The tier determines timeslice, preemption aggressiveness, and demotion thresholds.
 
-| Tier | Name | Wait Budget | Starvation Limit | Slice Multiplier | Purpose |
-|:-----|:-----|:------------|:-----------------|:-----------------|:--------|
-| **0** | Critical Latency | 100µs | 5ms | 0.6x | Mouse/Keyboard input |
-| **1** | Realtime | 750µs | 3ms | 0.8x | Audio, networking |
-| **2** | Critical | 2ms | 4ms | 0.9x | Compositor, kernel threads |
-| **3** | Gaming | 4ms | 8ms | 1.0x | **The Game Loop** |
-| **4** | Interactive | 8ms | 16ms | 1.1x | Normal applications |
-| **5** | Batch | 20ms | 40ms | 1.2x | Compilers, builds |
-| **6** | Background | ∞ | 100ms | 1.3x | Encoders, bulk work |
+### Tier Overview
+
+| Tier | Name | Typical Tasks | Priority |
+|:-----|:-----|:--------------|:---------|
+| **0** | Critical Latency | Mouse, keyboard, game input | Highest |
+| **1** | Realtime | Audio, networking, vsync | Very High |
+| **2** | Critical | Compositor, kernel threads | High |
+| **3** | Gaming | Game render loop, physics | Normal (baseline) |
+| **4** | Interactive | Browsers, editors, desktop apps | Lower |
+| **5** | Batch | Compilers, builds, nice'd tasks | Low |
+| **6** | Background | Encoders, backup, bulk work | Lowest |
+
+### Tier Timing Parameters
+
+| Tier | Wait Budget | Starvation Limit | Slice Multiplier | Quantum (2ms default) |
+|:-----|:------------|:-----------------|:-----------------|:----------------------|
+| **0** | 100µs | 5ms | 0.70x (717/1024) | 1.4ms |
+| **1** | 750µs | 3ms | 0.80x (819/1024) | 1.6ms |
+| **2** | 2ms | 4ms | 0.90x (922/1024) | 1.8ms |
+| **3** | 4ms | 8ms | 1.00x (1024/1024) | 2.0ms |
+| **4** | 8ms | 16ms | 1.10x (1126/1024) | 2.2ms |
+| **5** | 20ms | 40ms | 1.20x (1229/1024) | 2.4ms |
+| **6** | ∞ | 100ms | 1.30x (1331/1024) | 2.6ms |
+
+*Default: `--quantum 2000` (2ms)*
 
 ### Tier Classification Logic
-Tasks are classified based on their **sparse score** (0-100), computed from runtime behavior:
-- Short, infrequent bursts → High score → Higher tier (more responsive)
-- Long, continuous runs → Low score → Lower tier (background work)
+
+Tasks are classified based on their **sparse score** (0-100):
+
+| Sparse Score | Tier Assignment | Behavior |
+|:-------------|:----------------|:---------|
+| 100 AND avg_runtime < 250µs | **Tier 0** (Critical Latency) | Ultra-short bursts |
+| 100 AND avg_runtime >= 250µs | **Tier 1** (Realtime) | Very short, consistent |
+| 90-99 | **Tier 2** (Critical) | Short bursts |
+| 70-89 | **Tier 3** (Gaming) | Bursty, interactive |
+| 50-69 | **Tier 4** (Interactive) | Normal behavior |
+| 30-49 | **Tier 5** (Batch) | Longer runs |
+| 0-29 | **Tier 6** (Background) | Continuous CPU usage |
+
+### Sparse Score Calculation
+
+The sparse score measures how "bursty" a task is:
 
 ```c
-/* Branchless tier calculation using multiply-shift */
-u32 bucket = (sparse_score * 3277) >> 16;  // Division by 20 without div instruction
-u8 tier = 6 - clamp(bucket, 0, 6);
+/* Higher is better (more sparse = shorter waits = more responsive) */
+sparse_score = 100 - (avg_runtime / sparse_threshold);
 ```
+
+| CLI Option | Default | Effect |
+|:-----------|:--------|:-------|
+| `--sparse-threshold 125` | 125 | Gaming-optimized (shorter tasks score higher) |
+| `--sparse-threshold 50` | -- | Aggressive (only very short tasks get high scores) |
+| `--sparse-threshold 250` | -- | Relaxed (longer tasks still get decent scores) |
+
+**Example with `--sparse-threshold 50`**:
+- Task with 25µs avg runtime → Score = 100 - (25/50) = 99.5 → **Tier 2**
+- Task with 100µs avg runtime → Score = 100 - (100/50) = 98 → **Tier 2**
+- Task with 500µs avg runtime → Score = 100 - (500/50) = 90 → **Tier 2**
+- Task with 1ms avg runtime → Score = 100 - (1000/50) = 80 → **Tier 3**
+
+### Demotion Behavior
+
+Tasks that misbehave get demoted to prevent starvation of other tasks:
+
+| Condition | Action | Purpose |
+|:----------|:-------|:--------|
+| Runtime > Starvation Limit | Force preemption | Safety net for runaway tasks |
+| Wait time > Wait Budget (repeated) | Demote to next tier | Prevent queue bloat |
+| nice value > 0 | Start at Batch tier | Respect user priority hints |
+| nice value < 0 | Cap at Interactive tier | Prevent abuse |
+
+#### Per-Tier Demotion Targets
+
+| Current Tier | Demotes To | When |
+|:-------------|:-----------|:-----|
+| **0** Critical Latency | **1** Realtime | Runtime > 5ms or wait budget exceeded |
+| **1** Realtime | **2** Critical | Runtime > 3ms or wait budget exceeded |
+| **2** Critical | **3** Gaming | Runtime > 4ms or wait budget exceeded |
+| **3** Gaming | **4** Interactive | Runtime > 8ms or wait budget exceeded |
+| **4** Interactive | **5** Batch | Runtime > 16ms or wait budget exceeded |
+| **5** Batch | **6** Background | Runtime > 40ms or wait budget exceeded |
+| **6** Background | (none) | Cannot demote further |
+
+### Preemption Matrix
+
+Higher tiers can preempt lower tiers. A task in tier N can preempt any task in tier > N:
+
+| Preemptor → | Can Preempt ↓ |
+|:------------|:--------------|
+| **Tier 0** (Critical Latency) | Tiers 1, 2, 3, 4, 5, 6 |
+| **Tier 1** (Realtime) | Tiers 2, 3, 4, 5, 6 |
+| **Tier 2** (Critical) | Tiers 3, 4, 5, 6 |
+| **Tier 3** (Gaming) | Tiers 4, 5, 6 |
+| **Tier 4** (Interactive) | Tiers 5, 6 |
+| **Tier 5** (Batch) | Tier 6 only |
+| **Tier 6** (Background) | Nothing (lowest priority) |
+
+**Key insight**: Input (Tier 0) can preempt the game loop (Tier 3), ensuring mouse clicks are processed instantly even during heavy rendering.
+
+### Recommended Settings
+
+| Use Case | Settings | Effect |
+|:---------|:---------|:-------|
+| **Gaming (Default)** | `--quantum 2000 --sparse-threshold 125` | Balanced latency/throughput |
+| **Competitive Gaming** | `--quantum 2000 --sparse-threshold 50` | Lowest latency, more preemption |
+| **Desktop/Productivity** | `--quantum 4000 --sparse-threshold 200` | Smoother, less context switching |
 
 ---
 
@@ -491,7 +584,42 @@ The optimizations in `scx_cake` are informed by high-performance computing resea
 | Scheduler Latency | ~400 cycles | ~100 cycles |
 | Average Wait Time | ~15µs | ~2µs |
 | Direct Dispatch Rate | ~80% | ~91% |
-| 1% Low FPS | 120 (regression) | **210+** |
+| 1% Low FPS | 120 (regression) | **233** |
+
+### F. Benchmarking
+
+#### Test Methodology
+- **Tool**: [MangoHud](https://github.com/flightlessmango/MangoHud) for frametime capture
+- **Analysis**: [FlightlessSomething](https://flightlesssomething.ambrosia.one) for log visualization
+- **Capture Duration**: 30 seconds per test run
+- **Test Environment**: Controlled firing range scenarios for reproducibility
+
+#### Test Platform
+| Component | Specification |
+|:----------|:--------------|
+| **CPU** | AMD Ryzen 7 9800X3D (8C/16T @ ~5.0 GHz) |
+| **GPU** | NVIDIA RTX 4090 |
+| **RAM** | 96GB DDR5 |
+| **Resolution** | 4K (3840x2160) |
+| **OS** | CachyOS 6.18 (Linux kernel 6.12+) |
+
+#### Arc Raiders - Best Run (December 2025)
+
+| Metric | Value |
+|:-------|:------|
+| **1% Low FPS** | **233 FPS** |
+| **Average Frametime** | 3.8ms |
+| **1% Best Frametime** | 3.63ms |
+| **97th Percentile** | 4.08ms |
+
+#### Performance History
+
+| Date | Build | 1% Low FPS | Notes |
+|:-----|:------|:-----------|:------|
+| Dec 2025 (latest) | scx_bpf_now + idle streamlining | **233 FPS** | Current best |
+| Dec 2025 (mid) | Cache line padding | ~210 FPS | Stable baseline |
+| Dec 2025 (early) | 1ms starvation regression | 120 FPS | Too aggressive |
+| Initial | Baseline implementation | ~180 FPS | Starting point |
 
 ---
 
