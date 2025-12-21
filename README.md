@@ -647,14 +647,19 @@ In verbose mode, watch for:
 - **DirectDispatch%**: Should be >90%
 
 ### CLI Options
+
 | Option | Default | Description |
 |:-------|:--------|:------------|
-| `--quantum` | 3ms | Base timeslice in milliseconds |
-| `--new-flow-bonus` | 1.5ms | Bonus slice for newly woken tasks |
+| `--quantum` | 2000 (2ms) | Base timeslice in microseconds |
 | `--sparse-threshold` | 125 | Threshold for sparse score calculation |
-| `--starvation` | 5ms | Global starvation limit |
+| `--starvation` | 5000 (5ms) | Global starvation limit in microseconds |
 | `--verbose` / `-v` | off | Enable TUI monitoring |
-| `--interval` | 1000ms | Stats update interval |
+| `--interval` | 1000 | Stats update interval in milliseconds |
+
+### Recommended Testing Command
+```bash
+sudo ./start.sh --quantum 2000 --sparse-threshold 50
+```
 
 ---
 
