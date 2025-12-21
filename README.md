@@ -651,14 +651,24 @@ In verbose mode, watch for:
 | Option | Default | Description |
 |:-------|:--------|:------------|
 | `--quantum` | 2000 (2ms) | Base timeslice in microseconds |
-| `--sparse-threshold` | 125 | Threshold for sparse score calculation |
-| `--starvation` | 5000 (5ms) | Global starvation limit in microseconds |
+| `--new-flow-bonus` | 8000 (8ms) | Bonus slice for newly woken tasks |
+| `--sparse-threshold` | 125 | Threshold for sparse score calculation (‰) |
+| `--starvation` | 100000 (100ms) | Global starvation limit in microseconds |
 | `--verbose` / `-v` | off | Enable TUI monitoring |
 | `--interval` | 1000 | Stats update interval in milliseconds |
 
 ### Recommended Testing Command
 ```bash
 sudo ./start.sh --quantum 2000 --sparse-threshold 50
+```
+
+**Output when started:**
+```
+scx_cake scheduler started
+  Quantum:          2000 µs
+  New flow bonus:   8000 µs
+  Sparse threshold: 50‰
+  Starvation limit: 100000 µs
 ```
 
 ---
