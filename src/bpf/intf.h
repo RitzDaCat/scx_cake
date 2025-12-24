@@ -52,20 +52,22 @@ enum cake_flow_flags {
 };
 
 /*
- * Per-task flow state tracked in BPF (24 bytes)
- * Fits 2-3 contexts per 64-byte cache line.
+ * Per-task flow state tracked in BPF (16 bytes)
+ * Fits exactly 4 contexts per 64-byte cache line (100% utilization).
  * 
  * COMPRESSION:
  * - Timestamps: u32 (Wraps every 4.2s) - Acceptable for active gaming.
  * - Info: Packed into single u32 bitfield.
+ * - Slice: u32 (max 5.2ms fits in u32, saves 4 bytes).
+ * - Runtime fields: Packed into single u32 (deficit:16, avg:16).
  */
 struct cake_task_ctx {
-    u64 next_slice;        /* 8B: OPTIMIZATION: Pre-computed slice (ns) */
+    u32 next_slice;        /* 4B: Pre-computed slice (ns), reduced from u64 */
     u32 last_run_at;       /* 4B: Last run (ns), wraps 4.2s */
-    u32 last_wake_ts;      /* 4B: NEW: Wake TS (ns), wraps 4.2s */
+    u32 last_wake_ts;      /* 4B: Wake TS (ns), wraps 4.2s */
     u32 packed_info;       /* 4B: Bitfield (Err, Wait, Score, Tier, Flags) */
-    u16 deficit_us;        /* 2B: NEW: Deficit (us), max 65ms */
-    u16 avg_runtime_us;    /* 2B: HFT Kalman Estimate */
+    /* Packed: deficit_us (lower 16 bits), avg_runtime_us (upper 16 bits) */
+    u32 runtime_deficit;   /* 4B: deficit_us:16, avg_runtime_us:16 */
 };
 
 /* Bitfield Offsets for packed_info */
@@ -81,6 +83,13 @@ struct cake_task_ctx {
 #define MASK_SPARSE_SCORE   0x7F
 #define MASK_TIER           0x07
 #define MASK_FLAGS          0x0F
+
+/* Accessor macros for packed runtime_deficit field */
+#define GET_DEFICIT_US(ctx)      ((u16)((ctx)->runtime_deficit & 0xFFFF))
+#define SET_DEFICIT_US(ctx, val) ((ctx)->runtime_deficit = ((ctx)->runtime_deficit & 0xFFFF0000) | ((val) & 0xFFFF))
+
+#define GET_AVG_RUNTIME_US(ctx)      ((u16)((ctx)->runtime_deficit >> 16))
+#define SET_AVG_RUNTIME_US(ctx, val) ((ctx)->runtime_deficit = ((ctx)->runtime_deficit & 0xFFFF) | ((u32)(val) << 16))
 
 /*
  * Statistics shared with userspace
