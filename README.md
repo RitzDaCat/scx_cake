@@ -636,6 +636,7 @@ cd scx_cake
 sudo ./start.sh
 ```
 
+
 ### Monitoring (Verbose Mode)
 ```bash
 sudo ./start.sh -v

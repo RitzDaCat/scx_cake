@@ -8,6 +8,7 @@
 mod stats;
 mod tui;
 
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,10 @@ struct Args {
     /// Statistics update interval in seconds
     #[arg(long, default_value_t = 1)]
     interval: u64,
+
+    /// Run as daemon (detach from terminal and return immediately)
+    #[arg(long)]
+    daemon: bool,
 }
 
 struct Scheduler<'a> {
@@ -144,6 +149,37 @@ fn main() -> Result<()> {
     ).init();
 
     let args = Args::parse();
+
+    // Daemon mode: fork and detach from terminal
+    if args.daemon {
+        // Fork the process
+        match unsafe { libc::fork() } {
+            -1 => {
+                return Err(anyhow::anyhow!("Failed to fork process: {}", std::io::Error::last_os_error()));
+            }
+            0 => {
+                // Child process: continue execution
+                // Detach from terminal by creating new session
+                if unsafe { libc::setsid() } == -1 {
+                    return Err(anyhow::anyhow!("Failed to create new session: {}", std::io::Error::last_os_error()));
+                }
+                
+                // Close stdin, stdout, stderr (redirect to /dev/null)
+                let dev_null = std::fs::File::create("/dev/null")
+                    .context("Failed to open /dev/null")?;
+                unsafe {
+                    libc::dup2(dev_null.as_raw_fd(), libc::STDIN_FILENO);
+                    libc::dup2(dev_null.as_raw_fd(), libc::STDOUT_FILENO);
+                    libc::dup2(dev_null.as_raw_fd(), libc::STDERR_FILENO);
+                }
+            }
+            pid => {
+                // Parent process: exit immediately
+                println!("scx_cake daemon started (PID: {})", pid);
+                return Ok(());
+            }
+        }
+    }
 
     // Set up signal handler
     let shutdown = Arc::new(AtomicBool::new(false));

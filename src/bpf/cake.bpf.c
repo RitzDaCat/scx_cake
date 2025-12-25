@@ -1187,4 +1187,4 @@ SCX_OPS_DEFINE(cake_ops,
                .init           = (void *)cake_init,
                .exit           = (void *)cake_exit,
                .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,
-               .name           = "cake");
+               .name           = "scx_cake");
