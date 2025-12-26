@@ -71,9 +71,11 @@ struct cake_stats stats_array[64] SEC(".bss");
  */
 static __always_inline struct cake_stats *get_local_stats(void)
 {
-    /* Use CPU 0 as fallback - stats are per-CPU but we can't get CPU in all contexts */
-    /* In practice, stats are updated from cake_running/cake_dispatch which have CPU context */
-    return &stats_array[0];
+    u32 cpu = bpf_get_smp_processor_id();
+
+    if (cpu >= 64)
+        return NULL;
+    return &stats_array[cpu];
 }
 
 /* CPU status accessed via cpu_status_array - includes tier and cooldown timestamp */
