@@ -71,35 +71,23 @@ struct cake_stats stats_array[64] SEC(".bss");
  */
 static __always_inline struct cake_stats *get_local_stats(void)
 {
-    /* Use CPU 0 as fallback - stats are per-CPU but we can't get CPU in all contexts */
-    /* In practice, stats are updated from cake_running/cake_dispatch which have CPU context */
-    return &stats_array[0];
+    u32 cpu = bpf_get_smp_processor_id();
+
+    if (cpu >= 64)
+        return NULL;
+    return &stats_array[cpu];
 }
 
 /* CPU status accessed via cpu_status_array - includes tier and cooldown timestamp */
 
 /*
- * Global Idle Mask (0-Cycle Read)
- * Atomic bitmask of currently idle CPUs.
- * Read: 1 L1 load = ~2 cycles (0-cycle if in register)
- * Write: Atomic update (rare, only on idle transitions)
- * OPTIMIZATION: BSS Global Variable (No Map Lookup Overhead)
+ * MASKS REMOVED for "Lazy Read" Optimization.
+ * We now scan cpu_status_array directly to avoid atomic contention.
  */
-u64 idle_mask SEC(".bss");
+/* u64 idle_mask SEC(".bss"); */
+/* u64 victim_mask SEC(".bss"); */
 
-/*
- * OPTIMIZATION: Cache Line Padding
- * Prevents false sharing between idle_mask and victim_mask.
- */
 u64 __mask_pad[7] SEC(".bss");
-
-/*
- * Global Victim Mask (0-Cycle Read)
- * Atomic bitmask of CPUs running victim-eligible tasks (tier >= INTERACTIVE).
- * Read: 1 L1 load = ~2 cycles
- * Write: Atomic update (rare, only on tier changes)
- */
-u64 victim_mask SEC(".bss");
 
 /* User exit info for graceful scheduler exit */
 UEI_DEFINE(uei);
@@ -476,12 +464,8 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     /* 
-     * OPTIMIZATION: 0-Cycle Idle Search (Global Bitmask)
-     * Load global mask: 1 L1 load = ~2 cycles (0-cycle if cached in register)
-     * TZCNT instruction: 1 cycle (hardware)
-     * TOTAL: ~3 cycles (vs 170-410 cycles with map lookups)
+     * LAZY READ OPTIMIZATION: Scan Scoreboard instead of global masks.
      */
-    u64 mask = idle_mask;  /* Single load, reused throughout function */
     
     /* Move tier read up for the check */
     u8 tier = GET_TIER(tctx);
@@ -495,59 +479,33 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     u64 now = scx_bpf_now();
     tctx->last_wake_ts = (u32)now;
     
-    if (mask == 0 && tier > REALTIME_DSQ) {
-        /* No idle CPUs exists. Skip expensive LLC search. */
-        return prev_cpu;
+    /*
+     * Lazy Scan: Find first Idle CPU
+     */
+    s32 best_idle = -1;
+    s32 i;
+    u32 nr_cpus = scx_bpf_nr_cpu_ids();
+
+    /* Try prev_cpu first (sticky) */
+    if (prev_cpu >= 0 && prev_cpu < nr_cpus) {
+        if (cpu_status_array[prev_cpu].tier == CAKE_TIER_IDLE) {
+            best_idle = prev_cpu;
+        }
     }
 
-    /* 
-     * OPTIMIZATION: Smart Bypass (Cycle Saver)
-     * If we know the system is saturated (mask == 0),
-     * searching is wasteful. Tier 0/1 fall through to here.
-     */
-    bool saturated = (mask == 0);
-
-    if (saturated) {
-        cpu = prev_cpu;
-        is_idle = false;
-    } else {
-        /* 
-         * OPTIMIZATION: Bitmask Idle Find (O(1))
-         * Instead of scanning neighbors or walking lists, we just
-         * find the first set bit in the mask.
-         * 
-         * We prefer the previous CPU if it is in the mask (Sticky).
-         */
-        
-        /* Step 1: Check Sticky/Prev CPU */
-        bool prev_is_idle = false;
-        if (prev_cpu >= 0 && prev_cpu < 64) {
-             if (mask & (1ULL << prev_cpu)) {
-                 is_idle = true;
-                 cpu = prev_cpu;
-                 prev_is_idle = true;
-             }
-        }
-        
-        if (!prev_is_idle) {
-            /* 
-             * Step 2: Instant Idle Find
-             * __builtin_ctzll finds the index of the first ls-bit.
-             * This finds the lowest ID idle CPU in O(1).
-             * Uses cached mask from function start.
-             */
-            if (mask) {
-                cpu = __builtin_ctzll(mask);
-                is_idle = true;
-            } else {
-                 /* Racing condition: mask became 0 between check and load */
-                 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    if (best_idle < 0) {
+        /* Scan for idle */
+        bpf_for(i, 0, 64) {
+            if (i >= nr_cpus) break;
+            if (cpu_status_array[i].tier == CAKE_TIER_IDLE) {
+                best_idle = i;
+                break;
             }
         }
     }
 
-    /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
-    if (is_idle) {
+    if (best_idle >= 0) {
+        cpu = best_idle;
         /* Use SCX_ENQ_LAST to skip redundant enqueue call - saves 5-20µs */
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, SCX_ENQ_LAST);
         if (enable_stats) {
@@ -558,37 +516,28 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     /* 
-     * Preemption Injection
+     * Preemption Injection (Victim Selection)
      * If we didn't find an idle CPU, but this is a latency-sensitive task,
      * check if the target CPU is running something low priority.
-     * Note: tier already read above.
      */
     if (tier <= REALTIME_DSQ) { // Tier 0 (CritLatency) or Tier 1 (Realtime)
         /* 
-         * OPTIMIZATION: Smart Victim Selection
-         * Instead of blindly picking prev_cpu, scan neighbors (likely LLC/CCD)
-         * to find a lower priority victim.
-         * 
-         * Scan window: 4 CPUs (prev, +1, +2, +3).
-         * Cost: 4 * 20 cycles = ~80 cycles.
-         * Benefit: Avoids blindly killing a Game Thread if a Background task is nearby.
+         * LAZY READ OPTIMIZATION: Scan Scoreboard for Victims
          */
-        s32 best_cpu = -1;
+        s32 best_victim = -1;
 
-        /* 
-         * OPTIMIZATION: 0-Cycle Victim Selection (Global Bitmask)
-         * Load global mask: 1 L1 load = ~2 cycles
-         * TZCNT instruction: 1 cycle
-         * TOTAL: ~3 cycles (vs 170-410 cycles with map lookups)
-         */
-        u64 victims = victim_mask;
-        if (victims) {
-            best_cpu = __builtin_ctzll(victims);  /* O(1) TZCNT instruction */
+        bpf_for(i, 0, 64) {
+            if (i >= nr_cpus) break;
+            /* Match victim mask logic: tier >= INTERACTIVE (4) */
+            if (cpu_status_array[i].tier >= INTERACTIVE_DSQ && cpu_status_array[i].tier != CAKE_TIER_IDLE) {
+                best_victim = i;
+                break;
+            }
         }
         
         /* Did we find a victim? */
-        if (best_cpu >= 0 && best_cpu < 64) {
-            struct cake_cpu_status *cpu_status = &cpu_status_array[best_cpu];
+        if (best_victim >= 0) {
+            struct cake_cpu_status *cpu_status = &cpu_status_array[best_victim];
             u64 cooldown_ns = preempt_cooldown_ns[tier & 7];
             u64 time_since_preempt = now - cpu_status->last_preempt_ts;
             
@@ -613,7 +562,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
             
             if (can_preempt) {
                 cpu_status->last_preempt_ts = now;
-                scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
+                scx_bpf_kick_cpu(best_victim, SCX_KICK_PREEMPT);
                 
                 if (enable_stats) {
                     struct cake_stats *s = get_local_stats();
@@ -625,12 +574,13 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
                  * 
                  * Let's update 'cpu' to 'best_cpu' so we try to enqueue locally there!
                  */
-                cpu = best_cpu;
+                return best_victim;
             }
         }
     }
 
-    return cpu;
+    /* Default to prev_cpu if no better option found */
+    return prev_cpu;
 }
 
 /*
@@ -711,38 +661,47 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
      */
     if (tier <= REALTIME_DSQ) {
         /* Find a CPU running lower-priority task that can dispatch our task */
-        u64 victims = victim_mask;  /* 0-cycle read from global */
-        if (victims) {
-            s32 victim_cpu = __builtin_ctzll(victims);
-            if (victim_cpu >= 0 && victim_cpu < 64) {
-                struct cake_cpu_status *cpu_status = &cpu_status_array[victim_cpu];
-                u64 now = scx_bpf_now();
-                u64 cooldown_ns = preempt_cooldown_ns[tier & 7];
-                u64 time_since_preempt = now - cpu_status->last_preempt_ts;
-                
-                /* 
-                 * Safety-critical bypass for Tier 0 (Critical Latency):
-                 * If > 100µs since last preempt, allow preemption even if cooldown hasn't expired.
-                 * This ensures mouse input (8kHz = 125µs per poll) can preempt when needed.
-                 * For other tiers, respect the full cooldown to prevent storms.
-                 */
-                bool can_preempt = false;
-                if (tier == CRITICAL_LATENCY_DSQ) {
-                    /* Tier 0: Allow if cooldown expired OR if > 100µs since last preempt */
-                    if (time_since_preempt > cooldown_ns || time_since_preempt > 100000) {
-                        can_preempt = true;
-                    }
-                } else {
-                    /* Other tiers: Only if cooldown expired */
-                    if (time_since_preempt > cooldown_ns) {
-                        can_preempt = true;
-                    }
+        s32 victim_cpu = -1;
+        s32 i;
+        u32 nr_cpus = scx_bpf_nr_cpu_ids();
+
+        /* LAZY READ: Scan Scoreboard */
+        bpf_for(i, 0, 64) {
+            if (i >= nr_cpus) break;
+            if (cpu_status_array[i].tier >= INTERACTIVE_DSQ && cpu_status_array[i].tier != CAKE_TIER_IDLE) {
+                victim_cpu = i;
+                break;
+            }
+        }
+
+        if (victim_cpu >= 0) {
+            struct cake_cpu_status *cpu_status = &cpu_status_array[victim_cpu];
+            u64 now = scx_bpf_now();
+            u64 cooldown_ns = preempt_cooldown_ns[tier & 7];
+            u64 time_since_preempt = now - cpu_status->last_preempt_ts;
+
+            /*
+             * Safety-critical bypass for Tier 0 (Critical Latency):
+             * If > 100µs since last preempt, allow preemption even if cooldown hasn't expired.
+             * This ensures mouse input (8kHz = 125µs per poll) can preempt when needed.
+             * For other tiers, respect the full cooldown to prevent storms.
+             */
+            bool can_preempt = false;
+            if (tier == CRITICAL_LATENCY_DSQ) {
+                /* Tier 0: Allow if cooldown expired OR if > 100µs since last preempt */
+                if (time_since_preempt > cooldown_ns || time_since_preempt > 100000) {
+                    can_preempt = true;
                 }
-                
-                if (can_preempt) {
-                    cpu_status->last_preempt_ts = now;
-                    scx_bpf_kick_cpu(victim_cpu, SCX_KICK_PREEMPT);
+            } else {
+                /* Other tiers: Only if cooldown expired */
+                if (time_since_preempt > cooldown_ns) {
+                    can_preempt = true;
                 }
+            }
+
+            if (can_preempt) {
+                cpu_status->last_preempt_ts = now;
+                scx_bpf_kick_cpu(victim_cpu, SCX_KICK_PREEMPT);
             }
         }
     }
@@ -829,28 +788,9 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         /* Cooldown timestamp initialized to 0 on first use */
         
         /* 
-         * OPTIMIZATION: Update Victim Mask (Lazy, Only on Tier Change)
-         * Atomic update is rare (only when tier changes), but enables 0-cycle reads.
-         * Cost: ~100-300 cycles (atomic), but only on tier changes (rare).
-         * Benefit: 0-cycle reads in hot path (every wakeup).
+         * LAZY UPDATE: Removed atomic mask update.
+         * The tier update above is sufficient for lazy scanners.
          */
-        if (cpu_key < 64) {
-            u64 cpu_bit = (1ULL << cpu_key);
-            if (tier >= INTERACTIVE_DSQ) {
-                /* Relaxed atomic for stall-free writes */
-                #ifdef __ATOMIC_RELAXED
-                __atomic_fetch_or(&victim_mask, cpu_bit, __ATOMIC_RELAXED);
-                #else
-                __sync_fetch_and_or(&victim_mask, cpu_bit);
-                #endif
-            } else {
-                #ifdef __ATOMIC_RELAXED
-                __atomic_fetch_and(&victim_mask, ~cpu_bit, __ATOMIC_RELAXED);
-                #else
-                __sync_fetch_and_and(&victim_mask, ~cpu_bit);
-                #endif
-            }
-        }
     }
 
     /* WAIT BUDGET CHECK (CAKE AQM) */
@@ -1013,35 +953,14 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 void BPF_STRUCT_OPS(cake_update_idle, s32 cpu, bool idle)
 {
     /* 
-     * OPTIMIZATION: Atomic Bitmask Update (Rare, But Enables 0-Cycle Reads)
-     * Atomic update: ~100-300 cycles (only on idle transitions, rare)
-     * Benefit: 0-cycle reads in hot path (every wakeup)
-     * Net: Massive win (170-410 cycles saved per wakeup vs 100-300 cycles per idle transition)
+     * OPTIMIZATION: Lazy Update (No Atomic Mask)
+     * Just update local scoreboard.
      */
     if (cpu >= 0 && cpu < 64) {
-        u64 bit = (1ULL << cpu);
         if (idle) {
-            /* Mark as Idle (Set Bit - Relaxed Atomic for Stall-Free Writes) */
-            /* Try relaxed memory ordering first - if not supported, fall back to __sync */
-            #ifdef __ATOMIC_RELAXED
-            __atomic_fetch_or(&idle_mask, bit, __ATOMIC_RELAXED);
-            #else
-            __sync_fetch_and_or(&idle_mask, bit);
-            #endif
-            
             /* Update scoreboard */
-            if (cpu < 64) {
-                struct cake_cpu_status *cpu_status = &cpu_status_array[cpu];
-                cpu_status->tier = 255; /* CAKE_TIER_IDLE */
-            }
-        } else {
-            /* Mark as Busy (Clear Bit - Relaxed Atomic for Stall-Free Writes) */
-            #ifdef __ATOMIC_RELAXED
-            __atomic_fetch_and(&idle_mask, ~bit, __ATOMIC_RELAXED);
-            #else
-            __sync_fetch_and_and(&idle_mask, ~bit);
-            #endif
-            /* When CPU becomes busy, tier will be updated by cake_running */
+            struct cake_cpu_status *cpu_status = &cpu_status_array[cpu];
+            cpu_status->tier = 255; /* CAKE_TIER_IDLE */
         }
     }
 }
@@ -1112,9 +1031,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
     /* BITWISE OPTIMIZATION: >> 10 (~ / 1024) instead of / 1000 */
     cached_threshold_ns = (quantum_ns * sparse_threshold) >> 10;
 
-    /* Initialize Idle Mask (Correctness Sync) */
+    /* Initialize Scoreboard */
     u32 nr_cpus = scx_bpf_nr_cpu_ids();
-    u64 init_mask = 0;
+
     /* Loop bounded for verifier (max 64 CPUs for mask) */
     for (s32 i = 0; i < 64; i++) {
         if (i >= nr_cpus) break;
@@ -1125,14 +1044,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
         struct task_struct *p = scx_bpf_cpu_curr(i);
         if (p && p->pid == 0) {
             cpu_status->tier = 255; /* CAKE_TIER_IDLE */
-            init_mask |= (1ULL << i);  /* Set idle bit */
         } else {
             cpu_status->tier = INTERACTIVE_DSQ; /* Default */
         }
         bpf_rcu_read_unlock();
     }
-    /* Direct assignment to global (no concurrency on init) */
-    idle_mask = init_mask;
 
     /* Create all 7 dispatch queues in priority order */
     ret = scx_bpf_create_dsq(CRITICAL_LATENCY_DSQ, -1);
