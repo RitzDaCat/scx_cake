@@ -44,25 +44,18 @@ struct {
  * Used for O(1) "CTZ" idle CPU finding.
  * Replaces linear "Fail-Fast" count.
  * OPTIMIZATION: BSS Global Variable (No Map Lookup Overhead)
+ * ALIGNMENT: 64-byte aligned to preventing False Sharing
  */
-u64 idle_mask SEC(".bss");
-
-/*
- * OPTIMIZATION: Cache Line Padding
- * Prevents false sharing between idle_mask and victim_mask.
- * On multi-core systems, atomic updates to adjacent variables cause
- * cross-core cache line invalidation. 56 bytes padding ensures
- * they reside in separate 64-byte cache lines.
- */
-u64 __mask_pad[7] SEC(".bss");
+u64 idle_mask SEC(".bss") __attribute__((aligned(64)));
 
 /*
  * Global Victim Mask (O(1) Victim Selection)
  * Atomic bitmask of CPUs running victim-eligible tasks (tier >= INTERACTIVE).
  * Used for O(1) "CTZ" victim finding in preemption injection.
  * Updated lazily (only when tier changes) to minimize overhead.
+ * ALIGNMENT: 64-byte aligned to preventing False Sharing
  */
-u64 victim_mask SEC(".bss");
+u64 victim_mask SEC(".bss") __attribute__((aligned(64)));
 
 /*
  * Global CPU Tier Map (The "Scoreboard")
@@ -684,26 +677,27 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
      */
     if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
         /* Give background a chance even if others have work */
-        if (scx_bpf_dsq_move_to_local(BACKGROUND_DSQ))
+        if (scx_bpf_dsq_nr_queued(BACKGROUND_DSQ) && scx_bpf_dsq_move_to_local(BACKGROUND_DSQ))
             return;
-        if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
+        if (scx_bpf_dsq_nr_queued(INTERACTIVE_DSQ) && scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
             return;
     }
     
     /* Priority order: Critical Latency → Realtime → Critical → Gaming → Interactive → Batch → Background */
-    if (scx_bpf_dsq_move_to_local(CRITICAL_LATENCY_DSQ))
+    if (scx_bpf_dsq_nr_queued(CRITICAL_LATENCY_DSQ) && scx_bpf_dsq_move_to_local(CRITICAL_LATENCY_DSQ))
         return;
-    if (scx_bpf_dsq_move_to_local(REALTIME_DSQ))
+    if (scx_bpf_dsq_nr_queued(REALTIME_DSQ) && scx_bpf_dsq_move_to_local(REALTIME_DSQ))
         return;
-    if (scx_bpf_dsq_move_to_local(CRITICAL_DSQ))
+    if (scx_bpf_dsq_nr_queued(CRITICAL_DSQ) && scx_bpf_dsq_move_to_local(CRITICAL_DSQ))
         return;
-    if (scx_bpf_dsq_move_to_local(GAMING_DSQ))
+    if (scx_bpf_dsq_nr_queued(GAMING_DSQ) && scx_bpf_dsq_move_to_local(GAMING_DSQ))
         return;
-    if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
+    if (scx_bpf_dsq_nr_queued(INTERACTIVE_DSQ) && scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
         return;
-    if (scx_bpf_dsq_move_to_local(BATCH_DSQ))
+    if (scx_bpf_dsq_nr_queued(BATCH_DSQ) && scx_bpf_dsq_move_to_local(BATCH_DSQ))
         return;
-    scx_bpf_dsq_move_to_local(BACKGROUND_DSQ);
+    if (scx_bpf_dsq_nr_queued(BACKGROUND_DSQ))
+        scx_bpf_dsq_move_to_local(BACKGROUND_DSQ);
 }
 
 /*
@@ -731,16 +725,23 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         cpu_status->tier = tier;
         
         /* 
-         * OPTIMIZATION: Lazy Victim Mask Update
-         * Only update victim_mask when tier changes (rare).
-         * Enables O(1) victim selection in preemption injection.
+         * OPTIMIZATION: Lazy Victim Mask Update (Logical Check + Relaxed)
+         * 1. Only update if the *logical* victim state changes (Victim <-> Non-Victim).
+         *    This avoids redundant atomics when switching between e.g. Batch/Background.
+         * 2. Use __ATOMIC_RELAXED to avoid full memory barriers.
+         *    Victim mask is a heuristic; strict ordering is not required.
          */
         if (cpu_key < 64) {
-            u64 cpu_bit = (1ULL << cpu_key);
-            if (tier >= INTERACTIVE_DSQ) {
-                __sync_fetch_and_or(&victim_mask, cpu_bit);
-            } else {
-                __sync_fetch_and_and(&victim_mask, ~cpu_bit);
+            bool old_is_victim = (cpu_status->tier >= INTERACTIVE_DSQ);
+            bool new_is_victim = (tier >= INTERACTIVE_DSQ);
+
+            if (old_is_victim != new_is_victim) {
+                u64 cpu_bit = (1ULL << cpu_key);
+                if (new_is_victim) {
+                    __atomic_fetch_or(&victim_mask, cpu_bit, __ATOMIC_RELAXED);
+                } else {
+                    __atomic_fetch_and(&victim_mask, ~cpu_bit, __ATOMIC_RELAXED);
+                }
             }
         }
     }
@@ -870,13 +871,6 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
     update_sparse_score(tctx, runtime);
 
     /* 
-     * OPTIMIZATION: Calc Tier for Next Wakeup (Zero-Cycle Enqueue)
-     * We calculate the tier NOW (while data is hot in L1) and save it.
-     * When this task wakes up later, it can just read the result.
-     */
-    update_task_tier(p, tctx);
-
-    /* 
      * OPTIMIZATION: Removed Dead Vtime Code
      * Since we use FIFO queues, updating p->scx.dsq_vtime has NO EFFECT.
      * Saved ~30 cycles of pointless math.
@@ -889,6 +883,14 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
         tctx->deficit_us -= (u16)runtime_us;
     else
         tctx->deficit_us = 0;
+
+    /* 
+     * OPTIMIZATION: Calc Tier for Next Wakeup (Zero-Cycle Enqueue)
+     * We calculate the tier NOW (while data is hot in L1) and save it.
+     * When this task wakes up later, it can just read the result.
+     * MOVED: Must run AFTER deficit update to ensure next_slice uses current credit!
+     */
+    update_task_tier(p, tctx);
 }
 
 /*
@@ -905,24 +907,22 @@ void BPF_STRUCT_OPS(cake_update_idle, s32 cpu, bool idle)
     /* Cap CPU ID to 63 for 64-bit mask safety */
     if (cpu >= 0 && cpu < 64) {
          u64 bit = (1ULL << cpu);
+         /* 
+          * OPTIMIZATION: Local Buffering (Test-and-Test-and-Set)
+          * We read the global mask into a local variable first.
+          * Only if the bit is different do we pay the cost of the atomic bus lock.
+          * This matches the "Local Buffering" pattern by avoiding "Naive" global updates.
+          */
+         u64 mask = idle_mask; 
+
          if (idle) {
-             /* Mark as Idle (Set Bit - Direct Global) */
-             __sync_fetch_and_or(&idle_mask, bit);
-             
-             /* 
-              * Note: we don't update victim_mask or scoreboard here.
-              * - idle_mask is the primary mechanism for finding idle CPUs
-              * - cake_running will update scoreboard when task starts
-              * - Saves ~40 cycles per idle transition
-              */
+             /* Mark as Idle (Set Bit) - Only if not already set */
+             if (!(mask & bit))
+                 __atomic_fetch_or(&idle_mask, bit, __ATOMIC_RELAXED);
          } else {
-             /* Mark as Busy (Clear Bit - Direct Global) */
-             __sync_fetch_and_and(&idle_mask, ~bit);
-             
-             /* 
-              * Note: we don't update victim_mask here. 
-              * cake_running will set it based on actual tier.
-              */
+             /* Mark as Busy (Clear Bit) - Only if currently set */
+             if (mask & bit)
+                 __atomic_fetch_and(&idle_mask, ~bit, __ATOMIC_RELAXED);
          }
     }
 }

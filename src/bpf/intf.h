@@ -66,6 +66,7 @@ struct cake_task_ctx {
     u32 packed_info;       /* 4B: Bitfield (Err, Wait, Score, Tier, Flags) */
     u16 deficit_us;        /* 2B: NEW: Deficit (us), max 65ms */
     u16 avg_runtime_us;    /* 2B: HFT Kalman Estimate */
+    u8 __pad[40];          /* Pad to 64 bytes (Cache Line Size) to prevent False Sharing */
 };
 
 /* Bitfield Offsets for packed_info */
