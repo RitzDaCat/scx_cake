@@ -206,17 +206,18 @@ struct {
  * Key: CPU ID
  * Value: Padded struct to prevent False Sharing (8 CPUs per cache line)
  */
-struct cake_cooldown_status {
+struct cake_cooldown_elem {
     u64 last_preempt_ts;
     u8 __pad[56]; /* Pad to 64 bytes */
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1024); /* Support up to 1024 CPUs */
-    __type(key, u32);
-    __type(value, struct cake_cooldown_status);
-} preempt_cooldown SEC(".maps");
+/*
+ * Per-CPU preemption cooldown timestamp (ns)
+ * REPLACED MAP WITH BSS ARRAY for Wait-Free Access.
+ * ALIGNMENT: 64-byte aligned to prevent False Sharing.
+ * SIZE: 256 to allow barrier-free verifier access (u8 range).
+ */
+struct cake_cooldown_elem cooldowns[256] SEC(".bss") __attribute__((aligned(64)));
 
 
 /*
@@ -552,27 +553,36 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         
         /* Did we find a victim? */
         if (best_cpu >= 0) {
-            u32 cpu_key = best_cpu;
-            struct cake_cooldown_status *cooldown;
+            /* 
+             * OPTIMIZATION: Direct BSS Access (Wait-Free & Barrier-Free)
+             * We sized the array to 256, so the verifier knows any u8 index (from ctz)
+             * is safe. No 'asm volatile' or masking required.
+             * 
+             * NOTE: Use volatile access instead of __atomic builtins to avoid
+             * LLVM backend crashes.
+             */
+            struct cake_cooldown_elem *cooldown = &cooldowns[best_cpu];
             
-            cooldown = bpf_map_lookup_elem(&preempt_cooldown, &cpu_key);
-            if (cooldown) {
-                if (now - cooldown->last_preempt_ts > 50000) {
-                    cooldown->last_preempt_ts = now;
-                    scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
-                    
-                    if (enable_stats) {
-                        struct cake_stats *s = get_local_stats();
-                        if (s) s->nr_input_preempts++;
-                    }
-                    /* 
-                     * but we are returning 'cpu' from this function.
-                     * If we are in 'saturation' bypass mode, 'cpu' is set to 'prev_cpu'.
-                     * 
-                     * Let's update 'cpu' to 'best_cpu' so we try to enqueue locally there!
-                     */
-                    cpu = best_cpu;
+            /* Relaxed load is fine for heuristic */
+            u64 last_ts = *(volatile u64 *)&cooldown->last_preempt_ts;
+            
+            if (now - last_ts > 50000) {
+                 /* Relaxed store */
+                *(volatile u64 *)&cooldown->last_preempt_ts = now;
+                
+                scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
+                
+                if (enable_stats) {
+                    struct cake_stats *s = get_local_stats();
+                    if (s) s->nr_input_preempts++;
                 }
+                /* 
+                 * but we are returning 'cpu' from this function.
+                 * If we are in 'saturation' bypass mode, 'cpu' is set to 'prev_cpu'.
+                 * 
+                 * Let's update 'cpu' to 'best_cpu' so we try to enqueue locally there!
+                 */
+                cpu = best_cpu;
             }
         }
     }
