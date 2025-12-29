@@ -464,6 +464,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 
         /* Loop 1: Start -> End */
         if (start < CAKE_MAX_CPUS && start < nr_cpus) {
+            #pragma unroll 4
             for (s32 i = start; i < CAKE_MAX_CPUS; i++) {
                 if (i >= nr_cpus) break;
 
@@ -479,6 +480,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         }
 
         /* Loop 2: 0 -> Start */
+        #pragma unroll 4
         for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
             if (i >= start) break; /* Wrapped around to where we started */
             if (i >= nr_cpus) break;
@@ -530,6 +532,7 @@ found_idle:
 
         /* Loop 1: Start -> End */
         if (start < CAKE_MAX_CPUS && start < nr_cpus) {
+            #pragma unroll 4
             for (s32 i = start; i < CAKE_MAX_CPUS; i++) {
                 if (i >= nr_cpus) break;
 
@@ -543,6 +546,7 @@ found_idle:
         }
 
         /* Loop 2: 0 -> Start */
+        #pragma unroll 4
         for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
             if (i >= start) break;
             if (i >= nr_cpus) break;
