@@ -45,6 +45,14 @@ enum cake_tier {
 };
 
 /*
+ * DSQ Sharding
+ * Number of shards per sharded tier (Gaming, Interactive).
+ * Must be a power of 2 for fast masking.
+ */
+#define SCX_DSQ_SHARD_COUNT 4
+#define SCX_DSQ_SHARD_MASK  (SCX_DSQ_SHARD_COUNT - 1)
+
+/*
  * Flow state flags (only CAKE_FLOW_NEW currently used)
  */
 enum cake_flow_flags {
@@ -82,6 +90,20 @@ struct cake_task_ctx {
 #define MASK_SPARSE_SCORE   0x7F
 #define MASK_TIER           0x07
 #define MASK_FLAGS          0x0F
+
+/*
+ * The Scoreboard: Per-CPU Status
+ * Replaces global atomic masks with a distributed Wait-Free array.
+ * Each CPU writes ONLY to its own slot.
+ * Readers scan the array linearly.
+ */
+#define CAKE_MAX_CPUS 256
+
+struct cake_cpu_status {
+    u8 is_idle;            /* 1B: 1 if idle, 0 if busy */
+    u8 tier;               /* 1B: Current running tier */
+    u8 __pad[62];          /* Pad to 64 bytes (Cache Line Size) to prevent False Sharing */
+};
 
 /*
  * Statistics shared with userspace
