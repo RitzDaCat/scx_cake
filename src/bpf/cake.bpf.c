@@ -455,20 +455,45 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     /* 2. Linear Scan if Prev not idle */
     if (best_idle < 0) {
         /* 
-         * Bounded loop for verifier.
-         * Optimized for cache prefetching (linear access).
+         * OPTIMIZATION: Topology-Aware Circular Scan
+         * Scan forward from prev_cpu to maximize cache locality (neighbors).
+         * Includes "Hardware Prefetching" via __builtin_prefetch.
          */
+        s32 start = prev_cpu + 1;
+
+        /* Loop 1: Start -> End */
+        if (start < CAKE_MAX_CPUS && start < nr_cpus) {
+            for (s32 i = start; i < CAKE_MAX_CPUS; i++) {
+                if (i >= nr_cpus) break;
+
+                /* Hardware Call: Prefetch next line to hide latency */
+                if (i + 1 < nr_cpus)
+                    __builtin_prefetch(&cpu_status[i + 1]);
+
+                if (cpu_status[i].is_idle) {
+                    best_idle = i;
+                    goto found_idle;
+                }
+            }
+        }
+
+        /* Loop 2: 0 -> Start */
         for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
+            if (i >= start) break; /* Wrapped around to where we started */
             if (i >= nr_cpus) break;
 
-            /* Read from local padded slot */
+            /* Hardware Call: Prefetch next line */
+            if (i + 1 < start)
+                __builtin_prefetch(&cpu_status[i + 1]);
+
             if (cpu_status[i].is_idle) {
                 best_idle = i;
-                break;
+                goto found_idle;
             }
         }
     }
 
+found_idle:
     if (best_idle >= 0) {
         cpu = best_idle;
         is_idle = true;
@@ -496,19 +521,39 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         s32 victim_cpu = -1;
 
         /* 
-         * OPTIMIZATION: Wait-Free Linear Scan for Victim
-         * Replaces Atomic Victim Mask.
-         * Scans for any CPU running INTERACTIVE or lower.
+         * OPTIMIZATION: Topology-Aware Circular Scan for Victim
+         * Prioritize preempting neighbors to keep work local.
          */
+        s32 start = prev_cpu + 1;
+
+        /* Loop 1: Start -> End */
+        if (start < CAKE_MAX_CPUS && start < nr_cpus) {
+            for (s32 i = start; i < CAKE_MAX_CPUS; i++) {
+                if (i >= nr_cpus) break;
+
+                if (i + 1 < nr_cpus) __builtin_prefetch(&cpu_status[i + 1]);
+
+                if (cpu_status[i].tier >= INTERACTIVE_DSQ) {
+                    victim_cpu = i;
+                    goto found_victim;
+                }
+            }
+        }
+
+        /* Loop 2: 0 -> Start */
         for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
+            if (i >= start) break;
             if (i >= nr_cpus) break;
+
+            if (i + 1 < start) __builtin_prefetch(&cpu_status[i + 1]);
 
             if (cpu_status[i].tier >= INTERACTIVE_DSQ) {
                 victim_cpu = i;
-                break;
+                goto found_victim;
             }
         }
         
+found_victim:
         /* Did we find a victim? */
         if (victim_cpu >= 0) {
             /* 
