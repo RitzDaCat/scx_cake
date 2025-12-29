@@ -460,6 +460,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
          * Includes "Hardware Prefetching" via __builtin_prefetch.
          */
         s32 start = prev_cpu + 1;
+        if (start < 0) start = 0;
 
         /* Loop 1: Start -> End */
         if (start < CAKE_MAX_CPUS && start < nr_cpus) {
@@ -525,6 +526,7 @@ found_idle:
          * Prioritize preempting neighbors to keep work local.
          */
         s32 start = prev_cpu + 1;
+        if (start < 0) start = 0;
 
         /* Loop 1: Start -> End */
         if (start < CAKE_MAX_CPUS && start < nr_cpus) {
