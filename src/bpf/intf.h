@@ -97,7 +97,7 @@ struct cake_task_ctx {
  * Each CPU writes ONLY to its own slot.
  * Readers scan the array linearly.
  */
-#define CAKE_MAX_CPUS 256
+#define CAKE_MAX_CPUS 64
 
 struct cake_cpu_status {
     u8 is_idle;            /* 1B: 1 if idle, 0 if busy */
