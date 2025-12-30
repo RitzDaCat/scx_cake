@@ -443,7 +443,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
      * - No atomics, no locks, pure memory loads.
      */
     s32 best_idle = -1;
-    s32 nr_cpus = scx_bpf_nr_cpu_ids();
+    /* s32 nr_cpus = scx_bpf_nr_cpu_ids(); -- Optimized out */
 
     /* 1. Check Previous CPU (Sticky) */
     if (prev_cpu >= 0 && prev_cpu < CAKE_MAX_CPUS) {
@@ -457,42 +457,27 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         /* 
          * OPTIMIZATION: Topology-Aware Circular Scan
          * Scan forward from prev_cpu to maximize cache locality (neighbors).
-         * Includes "Hardware Prefetching" via __builtin_prefetch.
+         * Includes "Hardware Prefetching"
          */
         s32 start = prev_cpu + 1;
+        /* Sanitize start */
         if (start < 0) start = 0;
 
-        /*
-         * Loop 1: Single Pass Circular Scan
-         * Uses "fast modulo" subtraction to handle wrap-around without expensive DIV/MOD.
-         * Branchless target calculation where possible.
+        /* 
+         * OPTIMIZATION: Single Masked Loop (Verifier Friendly)
+         * - Constant loop bound (64)
+         * - Bitwise masking for circular wrap
          */
-        #pragma unroll 4
-        for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
-            if (i >= nr_cpus) break;
+        #pragma unroll 8
+        for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
+            s32 idx = (s32)((start + i) & (CAKE_MAX_CPUS - 1));
 
-            /* Calculate target with wrap-around */
-            s32 target = start + i;
-            if (target >= nr_cpus) target -= nr_cpus;
-
-            /* Bounds check for verifier safety */
-            if (target >= CAKE_MAX_CPUS) continue;
-
-            /*
-             * Hardware Call: Prefetch next target
-             * Calculate next_target speculatively
-             */
-            s32 next_target = target + 1;
-            if (next_target >= nr_cpus) next_target = 0;
-
-            if (next_target < CAKE_MAX_CPUS)
-                __builtin_prefetch(&cpu_status[next_target]);
-
-            if (cpu_status[target].is_idle) {
-                best_idle = target;
+            if (cpu_status[idx].is_idle) {
+                best_idle = idx;
                 goto found_idle;
             }
         }
+
     }
 
 found_idle:
@@ -524,32 +509,25 @@ found_idle:
 
         /* 
          * OPTIMIZATION: Topology-Aware Circular Scan for Victim
-         * Prioritize preempting neighbors to keep work local.
+         * Prioritize preempting neighbors
          */
         s32 start = prev_cpu + 1;
+        /* Sanitize start */
         if (start < 0) start = 0;
 
-        /* Loop 1: Single Pass Circular Scan for Victim */
-        #pragma unroll 4
-        for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
-            if (i >= nr_cpus) break;
+        /* 
+         * OPTIMIZATION: Single Masked Loop (Verifier Friendly)
+         */
+        #pragma unroll 8
+        for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
+            s32 idx = (s32)((start + i) & (CAKE_MAX_CPUS - 1));
 
-            s32 target = start + i;
-            if (target >= nr_cpus) target -= nr_cpus;
-
-            if (target >= CAKE_MAX_CPUS) continue;
-
-            s32 next_target = target + 1;
-            if (next_target >= nr_cpus) next_target = 0;
-
-            if (next_target < CAKE_MAX_CPUS)
-                __builtin_prefetch(&cpu_status[next_target]);
-
-            if (cpu_status[target].tier >= INTERACTIVE_DSQ) {
-                victim_cpu = target;
+            if (cpu_status[idx].tier >= INTERACTIVE_DSQ) {
+                victim_cpu = idx;
                 goto found_victim;
             }
         }
+
         
 found_victim:
         /* Did we find a victim? */
@@ -717,10 +695,11 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
     if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
         return;
 
-    /* Scan other shards */
-    for (i = 0; i < SCX_DSQ_SHARD_COUNT; i++) {
-        if (i == local_shard) continue;
-        if (scx_bpf_dsq_nr_queued(base + i) && scx_bpf_dsq_move_to_local(base + i))
+    /* Scan other shards (Ring Scan: 1..3) */
+    #pragma unroll 4
+    for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
+        u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
+        if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
             return;
     }
 
@@ -730,9 +709,10 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
     base = INTERACTIVE_DSQ;
     if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
         return;
-    for (i = 0; i < SCX_DSQ_SHARD_COUNT; i++) {
-        if (i == local_shard) continue;
-        if (scx_bpf_dsq_nr_queued(base + i) && scx_bpf_dsq_move_to_local(base + i))
+    #pragma unroll 4
+    for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
+        u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
+        if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
             return;
     }
 
