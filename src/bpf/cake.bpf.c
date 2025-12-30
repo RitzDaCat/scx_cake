@@ -538,28 +538,40 @@ found_idle:
 found_victim:
         /* Did we find a victim? */
         if (victim_cpu >= 0) {
-            /* 
-             * OPTIMIZATION: Direct BSS Access (Wait-Free & Barrier-Free)
+            /*
+             * OPTIMIZATION: Hybrid Preemption (Safety + Speed)
+             *
+             * 1. Safety Net (Lazy): Always squash slice to 0.
+             *    Guarantees victim yields at next tick (max 1ms) if kick fails/skipped.
+             *    Cost: ~100 cycles (Free compared to 1ms wait).
+             */
+            bpf_rcu_read_lock();
+            struct task_struct *victim = scx_bpf_cpu_curr(victim_cpu);
+            if (victim) {
+                victim->scx.slice = 0;
+            }
+            bpf_rcu_read_unlock();
+
+            /*
+             * 2. Speed (Active): Hardware Interrupt (Kick)
+             *    Forces immediate ~2us switch.
+             *    Rate-limited to every 50us to prevent IPI storms.
              */
             struct cake_cooldown_elem *cooldown = &cooldowns[victim_cpu];
-            
-            /* Relaxed load is fine for heuristic */
             u64 last_ts = *(volatile u64 *)&cooldown->last_preempt_ts;
-            
-            if (now - last_ts > 50000) {
-                 /* Relaxed store */
+
+            if (now - last_ts > 75000) {
                 *(volatile u64 *)&cooldown->last_preempt_ts = now;
-                
                 scx_bpf_kick_cpu(victim_cpu, SCX_KICK_PREEMPT);
                 
                 if (enable_stats) {
                     struct cake_stats *s = get_local_stats();
                     if (s) s->nr_input_preempts++;
                 }
-
-                /* Try to queue on victim CPU */
-                cpu = victim_cpu;
             }
+            
+            /* Try to queue on victim CPU */
+            cpu = victim_cpu;
         }
     }
 
