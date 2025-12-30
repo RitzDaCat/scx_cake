@@ -7,6 +7,7 @@
 
 mod stats;
 mod tui;
+mod topology;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -89,9 +90,30 @@ impl<'a> Scheduler<'a> {
         }
 
         // Load the BPF program
-        let skel = open_skel
+        let mut skel = open_skel
             .load()
             .context("Failed to load BPF program")?;
+
+        // Initialize Topology and Scan Order
+        // We do this after load() so we can write to the BSS section
+        let topo = topology::Topology::new().unwrap_or_else(|e| {
+            warn!("Topology detection failed: {}", e);
+            warn!("Falling back to linear scan.");
+            topology::Topology { cpus: vec![] } // Empty will leave table as 0 (linear scan fallback if we logic checks 0)
+            // Actually 255 is our sentinal.
+        });
+        
+        let (is_dual_ccd, is_hybrid) = topo.check_features();
+        info!("Topology: Dual CCD: {}, Hybrid P & E: {}", is_dual_ccd, is_hybrid);
+
+        let scan_order = topo.generate_scan_order();
+        
+        // Write to BSS map
+        if let Some(bss) = skel.maps.bss_data.as_mut() {
+            bss.scx_cake_scan_order = scan_order; 
+        } else {
+            warn!("Failed to access BPF .bss data - topology scan disabled");
+        }
 
         Ok(Self { skel, args })
     }

@@ -3,6 +3,9 @@
 // Build script for scx_cake - compiles BPF code and generates bindings
 
 fn main() {
+    // Force BPF v4 instruction set for better code density and 32-bit ALU support
+    std::env::set_var("BPF_EXTRA_CFLAGS_PRE_INCL", "-O3 -mcpu=v4");
+
     scx_cargo::BpfBuilder::new()
         .unwrap()
         .enable_intf("src/bpf/intf.h", "bpf_intf.rs")

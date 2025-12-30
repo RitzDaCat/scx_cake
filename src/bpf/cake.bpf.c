@@ -48,6 +48,18 @@ struct {
  */
 struct cake_cpu_status cpu_status[CAKE_MAX_CPUS] SEC(".bss") __attribute__((aligned(64)));
 
+/*
+ * Global Scan Order Table (Topology Aware)
+ * Pre-computed by userspace to prioritize:
+ * 1. SMT Siblings
+ * 2. L3 Cache Siblings (Same CCD)
+ * 3. High Performance Cores (CPPC)
+ * 4. P-Cores over E-Cores
+ *
+ * Indexed as: scx_cake_scan_order[prev_cpu][nth_choice]
+ */
+u8 scx_cake_scan_order[CAKE_MAX_CPUS][CAKE_MAX_CPUS] SEC(".bss");
+
 static __always_inline struct cake_stats *get_local_stats(void)
 {
     u32 key = 0;
@@ -451,32 +463,32 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         }
     }
 
-    /* 2. Linear Scan if Prev not idle */
+    /* 2. Linear Scan (Table-Driven) */
     if (best_idle < 0) {
         /* 
-         * OPTIMIZATION: Topology-Aware Circular Scan
-         * Scan forward from prev_cpu to maximize cache locality (neighbors).
-         * Includes "Hardware Prefetching"
+         * Sanitize prev_cpu for array indexing.
+         * We use strict masking (AND 63) to force the compiler to emit a bound-limiting instruction
+         * that the BPF verifier can see. Checks like 'if (x > 63)' can be optimized in ways the verifier loses track of.
          */
-        s32 start = prev_cpu + 1;
-        /* Sanitize start */
-        if (start < 0) start = 0;
+        u32 safe_prev = (u32)prev_cpu & (CAKE_MAX_CPUS - 1);
 
-        /* 
-         * OPTIMIZATION: Single Masked Loop (Verifier Friendly)
-         * - Constant loop bound (64)
-         * - Bitwise masking for circular wrap
+        /*
+         * OPTIMIZATION: Pre-Computed Topology Scan
+         * Userspace generates the optimal search order for each CPU.
+         * Prioritizes: SMT -> LLC -> P-Cores -> CPPC Score
          */
         #pragma unroll
         for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
-            s32 idx = (s32)((start + i) & (CAKE_MAX_CPUS - 1));
+            s32 idx = (s32)scx_cake_scan_order[safe_prev][i];
+
+            /* Check valid range (0-63). 255 = Padding/Invalid */
+            if (idx >= CAKE_MAX_CPUS) continue;
 
             if (cpu_status[idx].is_idle) {
                 best_idle = idx;
                 goto found_idle;
             }
         }
-
     }
 
 found_idle:
@@ -507,19 +519,17 @@ found_idle:
         s32 victim_cpu = -1;
 
         /* 
-         * OPTIMIZATION: Topology-Aware Circular Scan for Victim
-         * Prioritize preempting neighbors
+         * OPTIMIZATION: Pre-Computed Topology Scan for Victim
          */
-        s32 start = prev_cpu + 1;
-        /* Sanitize start */
-        if (start < 0) start = 0;
+        /* Sanitize prev_cpu via masking */
+        u32 safe_prev = (u32)prev_cpu & (CAKE_MAX_CPUS - 1);
 
-        /* 
-         * OPTIMIZATION: Single Masked Loop (Verifier Friendly)
-         */
         #pragma unroll
         for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
-            s32 idx = (s32)((start + i) & (CAKE_MAX_CPUS - 1));
+            s32 idx = (s32)scx_cake_scan_order[safe_prev][i];
+            
+            /* Check valid range */
+            if (idx >= CAKE_MAX_CPUS) continue;
 
             /* 
              * Preemption Matrix:
