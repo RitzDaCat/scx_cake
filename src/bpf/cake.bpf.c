@@ -462,35 +462,34 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         s32 start = prev_cpu + 1;
         if (start < 0) start = 0;
 
-        /* Loop 1: Start -> End */
-        if (start < CAKE_MAX_CPUS && start < nr_cpus) {
-            #pragma unroll 4
-            for (s32 i = start; i < CAKE_MAX_CPUS; i++) {
-                if (i >= nr_cpus) break;
-
-                /* Hardware Call: Prefetch next line to hide latency */
-                if (i + 1 < nr_cpus)
-                    __builtin_prefetch(&cpu_status[i + 1]);
-
-                if (cpu_status[i].is_idle) {
-                    best_idle = i;
-                    goto found_idle;
-                }
-            }
-        }
-
-        /* Loop 2: 0 -> Start */
+        /*
+         * Loop 1: Single Pass Circular Scan
+         * Uses "fast modulo" subtraction to handle wrap-around without expensive DIV/MOD.
+         * Branchless target calculation where possible.
+         */
         #pragma unroll 4
         for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
-            if (i >= start) break; /* Wrapped around to where we started */
             if (i >= nr_cpus) break;
 
-            /* Hardware Call: Prefetch next line */
-            if (i + 1 < start)
-                __builtin_prefetch(&cpu_status[i + 1]);
+            /* Calculate target with wrap-around */
+            s32 target = start + i;
+            if (target >= nr_cpus) target -= nr_cpus;
 
-            if (cpu_status[i].is_idle) {
-                best_idle = i;
+            /* Bounds check for verifier safety */
+            if (target >= CAKE_MAX_CPUS) continue;
+
+            /*
+             * Hardware Call: Prefetch next target
+             * Calculate next_target speculatively
+             */
+            s32 next_target = target + 1;
+            if (next_target >= nr_cpus) next_target = 0;
+
+            if (next_target < CAKE_MAX_CPUS)
+                __builtin_prefetch(&cpu_status[next_target]);
+
+            if (cpu_status[target].is_idle) {
+                best_idle = target;
                 goto found_idle;
             }
         }
@@ -530,31 +529,24 @@ found_idle:
         s32 start = prev_cpu + 1;
         if (start < 0) start = 0;
 
-        /* Loop 1: Start -> End */
-        if (start < CAKE_MAX_CPUS && start < nr_cpus) {
-            #pragma unroll 4
-            for (s32 i = start; i < CAKE_MAX_CPUS; i++) {
-                if (i >= nr_cpus) break;
-
-                if (i + 1 < nr_cpus) __builtin_prefetch(&cpu_status[i + 1]);
-
-                if (cpu_status[i].tier >= INTERACTIVE_DSQ) {
-                    victim_cpu = i;
-                    goto found_victim;
-                }
-            }
-        }
-
-        /* Loop 2: 0 -> Start */
+        /* Loop 1: Single Pass Circular Scan for Victim */
         #pragma unroll 4
         for (s32 i = 0; i < CAKE_MAX_CPUS; i++) {
-            if (i >= start) break;
             if (i >= nr_cpus) break;
 
-            if (i + 1 < start) __builtin_prefetch(&cpu_status[i + 1]);
+            s32 target = start + i;
+            if (target >= nr_cpus) target -= nr_cpus;
 
-            if (cpu_status[i].tier >= INTERACTIVE_DSQ) {
-                victim_cpu = i;
+            if (target >= CAKE_MAX_CPUS) continue;
+
+            s32 next_target = target + 1;
+            if (next_target >= nr_cpus) next_target = 0;
+
+            if (next_target < CAKE_MAX_CPUS)
+                __builtin_prefetch(&cpu_status[next_target]);
+
+            if (cpu_status[target].tier >= INTERACTIVE_DSQ) {
+                victim_cpu = target;
                 goto found_victim;
             }
         }
