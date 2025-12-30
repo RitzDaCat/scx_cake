@@ -34,19 +34,19 @@ typedef signed long s64;
  * Lower tiers get LARGER slices (better throughput)
  */
 enum cake_tier {
-    CAKE_TIER_CRITICAL_LATENCY = 0,  /* Ultra-low latency: score=100 AND <250µs avg runtime */
-    CAKE_TIER_REALTIME    = 1,  /* Ultra-sparse: score=100 but >=250µs avg runtime */
-    CAKE_TIER_CRITICAL    = 2,  /* Very sparse: audio, compositor */
-    CAKE_TIER_GAMING      = 3,  /* Sparse/bursty: game threads, UI */
-    CAKE_TIER_INTERACTIVE = 4,  /* Baseline: default applications */
-    CAKE_TIER_BATCH       = 5,  /* Lower priority: nice > 0, heavy apps */
-    CAKE_TIER_BACKGROUND  = 6,  /* Bulk work: compilers, encoders */
-    CAKE_TIER_MAX         = 7,
+    CAKE_TIER_0 = 0,  /* Tier 0: score=100 AND <250µs avg runtime */
+    CAKE_TIER_1 = 1,  /* Tier 1: score=100 but >=250µs avg runtime */
+    CAKE_TIER_2 = 2,  /* Tier 2: audio, compositor */
+    CAKE_TIER_3 = 3,  /* Tier 3: game threads, UI */
+    CAKE_TIER_4 = 4,  /* Tier 4: default applications */
+    CAKE_TIER_5 = 5,  /* Tier 5: nice > 0, heavy apps */
+    CAKE_TIER_6 = 6,  /* Tier 6: compilers, encoders */
+    CAKE_TIER_MAX = 7,
 };
 
 /*
  * DSQ Sharding
- * Number of shards per sharded tier (Gaming, Interactive).
+ * Number of shards per sharded tier (Tier 3, Tier 4).
  * Must be a power of 2 for fast masking.
  */
 #define SCX_DSQ_SHARD_COUNT 4

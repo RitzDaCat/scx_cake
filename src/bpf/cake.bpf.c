@@ -7,9 +7,9 @@
  * interactive workloads.
  *
  * Key concepts from CAKE adapted here:
- * - Sparse flow detection: Low-CPU tasks (like gaming) get latency priority
+ * - Sparse flow detection: Low-CPU tasks get latency priority
  * - Direct dispatch: Waking tasks on idle CPUs run immediately
- * - Two-tier DSQ: Gaming/sparse tasks dispatched before normal tasks
+ * - Two-tier DSQ: Higher-tier tasks dispatched before normal tasks
  */
 
 #include <scx/common.bpf.h>
@@ -66,36 +66,36 @@ static u64 cached_threshold_ns;
 
 /*
  * Seven dispatch queues - one per tier, served in priority order:
- * - CRITICAL_LATENCY_DSQ: Ultra-low latency (score=100 AND <250µs avg) - highest priority
- * - REALTIME_DSQ:    Ultra-sparse tasks (score=100, >=250µs avg) - very high priority
- * - CRITICAL_DSQ:    Very sparse tasks (audio, compositor) - high priority
- * - GAMING_DSQ:      Sparse/bursty tasks (game threads, UI) - gaming priority  
- * - INTERACTIVE_DSQ: Normal tasks (default applications) - baseline priority
- * - BATCH_DSQ:       Lower priority work (nice > 0) - lower priority
- * - BACKGROUND_DSQ:  Bulk tasks (compilers, encoders) - lowest priority
+ * - DSQ_0: Ultra-low latency (score=100 AND <250µs avg) - highest priority
+ * - DSQ_1:    Ultra-sparse tasks (score=100, >=250µs avg) - very high priority
+ * - DSQ_2:    Very sparse tasks (audio, compositor) - high priority
+ * - DSQ_3:      Sparse/bursty tasks (game threads, UI) - gaming priority  
+ * - DSQ_4: Normal tasks (default applications) - baseline priority
+ * - DSQ_5:       Lower priority work (nice > 0) - lower priority
+ * - DSQ_6:  Bulk tasks (compilers, encoders) - lowest priority
  *
  * SHARDING OPTIMIZATION:
- * Gaming and Interactive tiers are sharded (SCX_DSQ_SHARD_COUNT = 4).
+ * Tier 3 and Tier 4 are sharded (SCX_DSQ_SHARD_COUNT = 4).
  * We reserve ID space for them.
  */
-#define CRITICAL_LATENCY_DSQ 0
-#define REALTIME_DSQ    1
-#define CRITICAL_DSQ    2
-#define GAMING_DSQ      3                             /* Base: 3, 4, 5, 6 */
-#define INTERACTIVE_DSQ (GAMING_DSQ + SCX_DSQ_SHARD_COUNT)     /* Base: 7, 8, 9, 10 */
-#define BATCH_DSQ       (INTERACTIVE_DSQ + SCX_DSQ_SHARD_COUNT) /* 11 */
-#define BACKGROUND_DSQ  (BATCH_DSQ + 1)               /* 12 */
+#define DSQ_0 0
+#define DSQ_1    1
+#define DSQ_2    2
+#define DSQ_3      3                             /* Base: 3, 4, 5, 6 */
+#define DSQ_4 (DSQ_3 + SCX_DSQ_SHARD_COUNT)     /* Base: 7, 8, 9, 10 */
+#define DSQ_5       (DSQ_4 + SCX_DSQ_SHARD_COUNT) /* 11 */
+#define DSQ_6  (DSQ_5 + 1)               /* 12 */
 
 /* Mapping from Tier ID (0-6) to Base DSQ ID */
 static const u64 tier_to_dsq_base[8] = {
-    CRITICAL_LATENCY_DSQ,
-    REALTIME_DSQ,
-    CRITICAL_DSQ,
-    GAMING_DSQ,
-    INTERACTIVE_DSQ,
-    BATCH_DSQ,
-    BACKGROUND_DSQ,
-    BACKGROUND_DSQ /* Pad */
+    DSQ_0,
+    DSQ_1,
+    DSQ_2,
+    DSQ_3,
+    DSQ_4,
+    DSQ_5,
+    DSQ_6,
+    DSQ_6 /* Pad */
 };
 
 /*
@@ -105,18 +105,18 @@ static const u64 tier_to_dsq_base[8] = {
  * PADDED TO 8 for Branchless Access (tier & 7).
  */
 static const u32 tier_multiplier[8] = {
-    717,   /* Critical Latency: 0.7x (70%) -> 717/1024 */
-    819,   /* Realtime:    0.8x (80%) -> 819/1024 */
-    922,   /* Critical:    0.9x (90%) -> 922/1024 */
-    1024,  /* Gaming:      1.0x (100%) -> 1024/1024 */
-    1126,  /* Interactive: 1.1x (110%) -> 1126/1024 */
-    1229,  /* Batch:       1.2x (120%) -> 1229/1024 */
-    1331,  /* Background:  1.3x (130%) -> 1331/1024 */
+    717,   /* Tier 0: 0.7x (70%) -> 717/1024 */
+    819,   /* Tier 1:    0.8x (80%) -> 819/1024 */
+    922,   /* Tier 2:    0.9x (90%) -> 922/1024 */
+    1024,  /* Tier 3:      1.0x (100%) -> 1024/1024 */
+    1126,  /* Tier 4: 1.1x (110%) -> 1126/1024 */
+    1229,  /* Tier 5:       1.2x (120%) -> 1229/1024 */
+    1331,  /* Tier 6:  1.3x (130%) -> 1331/1024 */
     1024,  /* PADDING: Entry 7 (Unused/Safe) */
 };
 
 /* Sparse score thresholds for tier classification (0-100) */
-#define THRESHOLD_GAMING      70   /* Score >= 70 → Gaming (only threshold actively used) */
+#define THRESHOLD_3      70   /* Score >= 70 → Tier 3 (only threshold actively used) */
 #define CAKE_TIER_IDLE 255 /* Special value for Scoreboard (Cpu is Idle) */
 
 /*
@@ -135,13 +135,13 @@ static const u32 tier_multiplier[8] = {
 
 /* Array for O(1) wait budget lookup. PADDED TO 8 for Branchless Access (tier & 7). */
 static const u64 wait_budget[8] = {
-    WAIT_BUDGET_CRITICAL_LATENCY, /* Tier 0: Critical Latency - 100µs */
-    WAIT_BUDGET_REALTIME,    /* Tier 1: Realtime - 750µs */
-    WAIT_BUDGET_CRITICAL,    /* Tier 2: Critical - 2ms */
-    WAIT_BUDGET_GAMING,      /* Tier 3: Gaming - 4ms */
-    WAIT_BUDGET_INTERACTIVE, /* Tier 4: Interactive - 8ms */
-    WAIT_BUDGET_BATCH,       /* Tier 5: Batch - 20ms */
-    0,                       /* Tier 6: Background - no limit */
+    WAIT_BUDGET_CRITICAL_LATENCY, /* Tier 0: 100µs */
+    WAIT_BUDGET_REALTIME,    /* Tier 1: 750µs */
+    WAIT_BUDGET_CRITICAL,    /* Tier 2: 2ms */
+    WAIT_BUDGET_GAMING,      /* Tier 3: 4ms */
+    WAIT_BUDGET_INTERACTIVE, /* Tier 4: 8ms */
+    WAIT_BUDGET_BATCH,       /* Tier 5: 20ms */
+    0,                       /* Tier 6: no limit */
     0,                       /* PADDING: Entry 7 (Safe) */
 };
 
@@ -246,11 +246,11 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p)
     ctx->last_wake_ts = 0;
     ctx->avg_runtime_us = 0;
     
-    /* Pack initial values: Err=255, Score=50, Tier=Interactive, Flags=New */
+    /* Pack initial values: Err=255, Score=50, Tier=Tier 4, Flags=New */
     u32 packed = 0;
     packed |= (255 & MASK_KALMAN_ERROR) << SHIFT_KALMAN_ERROR;
     packed |= (50  & MASK_SPARSE_SCORE) << SHIFT_SPARSE_SCORE;
-    packed |= (CAKE_TIER_INTERACTIVE & MASK_TIER) << SHIFT_TIER;
+    packed |= (CAKE_TIER_4 & MASK_TIER) << SHIFT_TIER;
     packed |= (CAKE_FLOW_NEW & MASK_FLAGS) << SHIFT_FLAGS;
     
     ctx->packed_info = packed;
@@ -302,11 +302,11 @@ static __always_inline void update_kalman_estimate(struct cake_task_ctx *tctx, u
  * Score ranges (7 tiers):
  *   100 + <50µs avg:   CritLatency - True input handlers
  *   100 + 50-500µs:    Realtime    - Fast sparse tasks (network IRQs)
- *   90-100 (fallback): Critical    - High-priority sparse
- *   70-89:  Gaming      - Sparse (game threads, UI)
- *   50-69:  Interactive - Baseline (default applications)
- *   30-49:  Batch       - Lower priority (nice > 0)
- *   0-29:   Background  - Bulk (compilers, encoders)
+ *   90-100 (fallback): Tier 2    - High-priority sparse
+ *   70-89:  Tier 3      - Sparse (game threads, UI)
+ *   50-69:  Tier 4 - Baseline (default applications)
+ *   30-49:  Tier 5       - Lower priority (nice > 0)
+ *   0-29:   Tier 6  - Bulk (compilers, encoders)
  *
  * OPTIMIZATION: Zero-Cycle Wakeup
  * We update the tier here (post-run) and store it in tctx.
@@ -369,10 +369,9 @@ static __always_inline void update_task_tier(struct task_struct *p, struct cake_
 /*
  * Update sparse score based on runtime behavior
  * 
- * Score affects tier classification:
- *   90-100: Critical, 75-89: Gaming, 25-74: Interactive, 0-24: Background
+ * Score affects tier classification.
  * 
- * We track promotions/demotions when crossing the Gaming threshold (75)
+ * We track promotions/demotions when crossing the Tier 3 threshold (70)
  * since this is the key boundary for gaming-relevant tasks.
  */
 static __always_inline void update_sparse_score(struct cake_task_ctx *tctx, u64 runtime_ns)
@@ -396,8 +395,8 @@ static __always_inline void update_sparse_score(struct cake_task_ctx *tctx, u64 
     SET_SPARSE_SCORE(tctx, (u32)raw_score);
 
     if (enable_stats) {
-        bool was_gaming = old_score >= THRESHOLD_GAMING;
-        bool is_gaming = raw_score >= THRESHOLD_GAMING;
+        bool was_gaming = old_score >= THRESHOLD_3;
+        bool is_gaming = raw_score >= THRESHOLD_3;
         
         if (was_gaming != is_gaming) {
              struct cake_stats *s = get_local_stats();
@@ -468,7 +467,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
          * - Constant loop bound (64)
          * - Bitwise masking for circular wrap
          */
-        #pragma unroll 8
+        #pragma unroll
         for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
             s32 idx = (s32)((start + i) & (CAKE_MAX_CPUS - 1));
 
@@ -504,7 +503,7 @@ found_idle:
      * Preemption Injection (Latency path)
      * If saturated, check if we can preempt a lower priority task.
      */
-    if (tier <= REALTIME_DSQ) { // Tier 0 (CritLatency) or Tier 1 (Realtime)
+    if (tier == CAKE_TIER_0) { /* Tier 0 only */
         s32 victim_cpu = -1;
 
         /* 
@@ -518,11 +517,18 @@ found_idle:
         /* 
          * OPTIMIZATION: Single Masked Loop (Verifier Friendly)
          */
-        #pragma unroll 8
+        #pragma unroll
         for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
             s32 idx = (s32)((start + i) & (CAKE_MAX_CPUS - 1));
 
-            if (cpu_status[idx].tier >= INTERACTIVE_DSQ) {
+            /* 
+             * Preemption Matrix:
+             * Preemptor: Tier 0 ONLY
+             * Victim: Tiers 1-5
+             * Protected: Tier 0, Tier 6
+             */
+            u8 v_tier = cpu_status[idx].tier;
+            if (v_tier >= CAKE_TIER_1 && v_tier <= CAKE_TIER_5) {
                 victim_cpu = idx;
                 goto found_victim;
             }
@@ -571,8 +577,8 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 
     tctx = get_task_ctx(p);
     if (unlikely(!tctx)) {
-        /* Fallback: dispatch to interactive DSQ */
-        scx_bpf_dsq_insert(p, INTERACTIVE_DSQ, quantum_ns, enq_flags);
+        /* Fallback: dispatch to Tier 4 DSQ */
+        scx_bpf_dsq_insert(p, DSQ_4, quantum_ns, enq_flags);
         return;
     }
 
@@ -602,13 +608,13 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 
     /*
      * Route to DSQ based on tier classification:
-     * - Critical Latency: CRITICAL_LATENCY_DSQ (true input handlers)
-     * - Realtime: REALTIME_DSQ (score=100, longer runtime)
-     * - Critical: CRITICAL_DSQ (audio, compositor)
-     * - Gaming: GAMING_DSQ (sparse/bursty tasks)
-     * - Interactive: INTERACTIVE_DSQ (normal applications)
-     * - Batch: BATCH_DSQ (nice > 0)
-     * - Background: BACKGROUND_DSQ (bulk work)
+     * - DSQ_0: True input handlers
+     * - DSQ_1: score=100, longer runtime
+     * - DSQ_2: audio, compositor
+     * - DSQ_3: sparse/bursty tasks
+     * - DSQ_4: normal applications
+     * - DSQ_5: nice > 0
+     * - DSQ_6: bulk work
      */
 
     /*
@@ -622,7 +628,7 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
      * Distribute tasks across shards to reduce DSQ lock contention.
      * Use (pid ^ cpu) for stateless distribution.
      */
-    if (tier == CAKE_TIER_GAMING || tier == CAKE_TIER_INTERACTIVE) {
+    if (tier == CAKE_TIER_3 || tier == CAKE_TIER_4) {
         u32 hash = (p->pid ^ bpf_get_smp_processor_id());
         dsq_id += (hash & SCX_DSQ_SHARD_MASK);
     }
@@ -641,13 +647,13 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
  * Dispatch tasks to run on this CPU
  * 
  * DSQs are served in strict priority order:
- *   1. Critical Latency (true input handlers - score=100, <250µs avg)
- *   2. Realtime (score=100, >=250µs avg)
- *   3. Critical (audio, compositor)
- *   4. Gaming (sparse/bursty)
- *   5. Interactive (normal apps)
- *   6. Batch (nice > 0)
- *   7. Background (bulk work)
+ *   1. Tier 0 (true input handlers - score=100, <250µs avg)
+ *   2. Tier 1 (score=100, >=250µs avg)
+ *   3. Tier 2 (audio, compositor)
+ *   4. Tier 3 (sparse/bursty)
+ *   5. Tier 4 (normal apps)
+ *   6. Tier 5 (nice > 0)
+ *   7. Tier 6 (bulk work)
  *
  * Starvation protection: Probabilistically check lower tiers
  * even if higher tiers have work, to prevent complete starvation.
@@ -667,36 +673,36 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
      */
     if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
         /* Give background a chance even if others have work */
-        if (scx_bpf_dsq_nr_queued(BACKGROUND_DSQ) && scx_bpf_dsq_move_to_local(BACKGROUND_DSQ))
+        if (scx_bpf_dsq_nr_queued(DSQ_6) && scx_bpf_dsq_move_to_local(DSQ_6))
             return;
-        if (scx_bpf_dsq_nr_queued(INTERACTIVE_DSQ) && scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
+        if (scx_bpf_dsq_nr_queued(DSQ_4) && scx_bpf_dsq_move_to_local(DSQ_4))
             return;
     }
     
-    /* Priority order: Critical Latency → Realtime → Critical → Gaming → Interactive → Batch → Background */
+    /* Priority order: Tier 0 → Tier 1 → Tier 2 → Tier 3 → Tier 4 → Tier 5 → Tier 6 */
 
     /* Non-sharded high priority tiers */
-    if (scx_bpf_dsq_nr_queued(CRITICAL_LATENCY_DSQ) && scx_bpf_dsq_move_to_local(CRITICAL_LATENCY_DSQ))
+    if (scx_bpf_dsq_nr_queued(DSQ_0) && scx_bpf_dsq_move_to_local(DSQ_0))
         return;
-    if (scx_bpf_dsq_nr_queued(REALTIME_DSQ) && scx_bpf_dsq_move_to_local(REALTIME_DSQ))
+    if (scx_bpf_dsq_nr_queued(DSQ_1) && scx_bpf_dsq_move_to_local(DSQ_1))
         return;
-    if (scx_bpf_dsq_nr_queued(CRITICAL_DSQ) && scx_bpf_dsq_move_to_local(CRITICAL_DSQ))
+    if (scx_bpf_dsq_nr_queued(DSQ_2) && scx_bpf_dsq_move_to_local(DSQ_2))
         return;
 
     /*
-     * Sharded Gaming Tier
+     * Sharded Gaming Tier (Tier 3)
      * Check local shard first (cpu % mask), then scan others.
      * Loop unrolled by compiler (4 iterations).
      */
     s32 i;
-    u64 base = GAMING_DSQ;
+    u64 base = DSQ_3;
     /* Try local shard first for affinity */
     u32 local_shard = cpu & SCX_DSQ_SHARD_MASK;
     if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
         return;
 
     /* Scan other shards (Ring Scan: 1..3) */
-    #pragma unroll 4
+    #pragma unroll
     for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
         u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
         if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
@@ -704,12 +710,12 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
     }
 
     /*
-     * Sharded Interactive Tier
+     * Sharded Interactive Tier (Tier 4)
      */
-    base = INTERACTIVE_DSQ;
+    base = DSQ_4;
     if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
         return;
-    #pragma unroll 4
+    #pragma unroll
     for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
         u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
         if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
@@ -717,10 +723,10 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
     }
 
     /* Non-sharded low priority tiers */
-    if (scx_bpf_dsq_nr_queued(BATCH_DSQ) && scx_bpf_dsq_move_to_local(BATCH_DSQ))
+    if (scx_bpf_dsq_nr_queued(DSQ_5) && scx_bpf_dsq_move_to_local(DSQ_5))
         return;
-    if (scx_bpf_dsq_nr_queued(BACKGROUND_DSQ))
-        scx_bpf_dsq_move_to_local(BACKGROUND_DSQ);
+    if (scx_bpf_dsq_nr_queued(DSQ_6))
+        scx_bpf_dsq_move_to_local(DSQ_6);
 }
 
 /*
@@ -760,7 +766,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         /* 
          * OPTIMIZATION: Bitwise Decay on Long Sleep
          * If task slept for > 33ms (33,000,000ns), decay its history.
-         * Tuned for Gaming: 33ms is ~2 frames. Resets "heavy" stats faster
+         * Tuned for Tier 3: 33ms is ~2 frames. Resets "heavy" stats faster
          * for bursty threads (e.g. loading screens -> gameplay).
          * >> 1 is 50% decay (cheap 0-cycle logic vs Kalman reset).
          */
@@ -801,7 +807,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         
         /* 
          * Check budget:
-         * Critical: 500us, Gaming: 2ms, Interactive: 10ms
+         * Tier 2: 2ms, Tier 3: 4ms, Tier 4: 8ms
          * OPTIMIZATION: Branchless access (tier & 7) - Padded array
          */
         u64 budget_ns = wait_budget[tier & 7];
@@ -820,7 +826,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         /* Since we don't have exact 'wait_checks' separate from sample loop, 
            we rely on the 10-sample window reset */
         
-        if (checks >= 10 && tier < CAKE_TIER_BACKGROUND) {
+        if (checks >= 10 && tier < CAKE_TIER_6) {
             if (violations >= 3) { /* > 30% bad waits */
                 /* Penalize score to force drop */
                 u32 current_score = GET_SPARSE_SCORE(tctx);
@@ -872,7 +878,7 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
     /* Update Kalman Filter Estimate (HFT Math) */
     update_kalman_estimate(tctx, runtime);
 
-    /* Update sparse score - this determines Gaming vs Normal DSQ */
+    /* Update sparse score - this determines Tier 3 vs Normal DSQ */
     update_sparse_score(tctx, runtime);
 
     /* 
@@ -902,10 +908,10 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
  * Periodic tick - check for starvation with per-tier thresholds
  * 
  * Each tier has its own starvation limit:
- *   Critical:    5ms  - Input handlers shouldn't run this long
- *   Gaming:      10ms - Game threads need responsiveness
- *   Interactive: 20ms - Normal apps get more leeway
- *   Background:  50ms - Bulk work can run longer
+ *   Tier 2:    4ms  - Input handlers shouldn't run this long
+ *   Tier 3:      8ms - Game threads need responsiveness
+ *   Tier 4: 16ms - Normal apps get more leeway
+ *   Tier 6:  100ms - Bulk work can run longer
  */
 void BPF_STRUCT_OPS(cake_update_idle, s32 cpu, bool idle)
 {
@@ -1004,41 +1010,41 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
         } else {
             cpu_status[i].is_idle = 0;
         }
-        /* Initialize tier to background/safe default */
-        cpu_status[i].tier = CAKE_TIER_BACKGROUND;
+        /* Initialize tier to Tier 6 default */
+        cpu_status[i].tier = CAKE_TIER_6;
         bpf_rcu_read_unlock();
     }
 
     /* Create all 7 dispatch queues in priority order */
-    ret = scx_bpf_create_dsq(CRITICAL_LATENCY_DSQ, -1);
+    ret = scx_bpf_create_dsq(DSQ_0, -1);
     if (ret < 0)
         return ret;
 
-    ret = scx_bpf_create_dsq(REALTIME_DSQ, -1);
+    ret = scx_bpf_create_dsq(DSQ_1, -1);
     if (ret < 0)
         return ret;
 
-    ret = scx_bpf_create_dsq(CRITICAL_DSQ, -1);
+    ret = scx_bpf_create_dsq(DSQ_2, -1);
     if (ret < 0)
         return ret;
 
-    /* Create Sharded Gaming DSQs */
+    /* Create Sharded Tier 3 DSQs */
     for (s32 i = 0; i < SCX_DSQ_SHARD_COUNT; i++) {
-        ret = scx_bpf_create_dsq(GAMING_DSQ + i, -1);
+        ret = scx_bpf_create_dsq(DSQ_3 + i, -1);
         if (ret < 0) return ret;
     }
 
-    /* Create Sharded Interactive DSQs */
+    /* Create Sharded Tier 4 DSQs */
     for (s32 i = 0; i < SCX_DSQ_SHARD_COUNT; i++) {
-        ret = scx_bpf_create_dsq(INTERACTIVE_DSQ + i, -1);
+        ret = scx_bpf_create_dsq(DSQ_4 + i, -1);
         if (ret < 0) return ret;
     }
 
-    ret = scx_bpf_create_dsq(BATCH_DSQ, -1);
+    ret = scx_bpf_create_dsq(DSQ_5, -1);
     if (ret < 0)
         return ret;
 
-    ret = scx_bpf_create_dsq(BACKGROUND_DSQ, -1);
+    ret = scx_bpf_create_dsq(DSQ_6, -1);
     if (ret < 0)
         return ret;
 
