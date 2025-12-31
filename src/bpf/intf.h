@@ -69,12 +69,13 @@ enum cake_flow_flags {
  */
 struct cake_task_ctx {
     u64 next_slice;        /* 8B: OPTIMIZATION: Pre-computed slice (ns) */
-    u32 last_run_at;       /* 4B: Last run (ns), wraps 4.2s */
-    u32 last_wake_ts;      /* 4B: NEW: Wake TS (ns), wraps 4.2s */
+    u64 last_run_at;       /* 8B: Last run (ns), no wrap */
+    u64 last_wake_ts;      /* 8B: NEW: Wake TS (ns), no wrap */
     u32 packed_info;       /* 4B: Bitfield (Err, Wait, Score, Tier, Flags) */
     u16 deficit_us;        /* 2B: NEW: Deficit (us), max 65ms */
     u16 avg_runtime_us;    /* 2B: HFT Kalman Estimate */
-    u8 __pad[40];          /* Pad to 64 bytes (Cache Line Size) to prevent False Sharing */
+    s32 last_victim_cpu;   /* 4B: NEW: Sticky Victim (The Bully Strategy) */
+    u8 __pad[28];          /* 32 -> 28 bytes (Total 64) */
 };
 
 /* Bitfield Offsets for packed_info */
@@ -102,7 +103,9 @@ struct cake_task_ctx {
 struct cake_cpu_status {
     u8 is_idle;            /* 1B: 1 if idle, 0 if busy */
     u8 tier;               /* 1B: Current running tier */
-    u8 __pad[62];          /* Pad to 64 bytes (Cache Line Size) to prevent False Sharing */
+    u8 __pad_0[6];         /* Align u64 */
+    u64 started_at;        /* 8B: NEW: Timestamp of current slice start */
+    u8 __pad[48];          /* 62 -> 48 bytes (Total 64) */
 };
 
 /*

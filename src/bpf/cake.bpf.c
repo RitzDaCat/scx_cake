@@ -262,6 +262,7 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p)
     ctx->last_run_at = 0;
     ctx->last_wake_ts = 0;
     ctx->avg_runtime_us = 0;
+    ctx->last_victim_cpu = -1; /* Initialize sticky victim */
     
     /* Pack initial values: Err=255, Score=50, Tier=Tier 4, Flags=New */
     u32 packed = 0;
@@ -449,7 +450,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
      * OPTIMIZATION: scx_bpf_now() uses cached rq->clock instead of TSC read.
      */
     u64 now = scx_bpf_now();
-    tctx->last_wake_ts = (u32)now;
+    tctx->last_wake_ts = now;
     
     /* 
      * OPTIMIZATION: Wait-Free Linear Scan (The Scoreboard)
@@ -462,10 +463,44 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     s32 victim_cpu = -1; /* Unified Loop: Store victim for later */
     /* s32 nr_cpus = scx_bpf_nr_cpu_ids(); -- Optimized out */
 
+    /* 
+     * 0. Check for Wake Sync (Hot Handoff)
+     * If user is yielding to us (SYNC), run on this CPU immediately.
+     * Conserves L1/L2 cache and avoids IPI.
+     */
+    if (wake_flags & SCX_WAKE_SYNC) {
+        s32 local = bpf_get_smp_processor_id();
+        /* Simple check: Just take it. Previous checks ensure validity. */
+        best_idle = local;
+        /* Implicit goto found_idle optimization by falling through or explicit goto */
+        goto found_idle;
+    }
+
     /* 1. Check Previous CPU (Sticky) */
     if (prev_cpu >= 0 && prev_cpu < CAKE_MAX_CPUS) {
         if (cpu_status[prev_cpu].is_idle) {
             best_idle = prev_cpu;
+        }
+    }
+
+    /* 1.5 Check Sticky Victim (The Bully Strategy) */
+    /* Only Tier 0 tasks use this to contain interrupt damage */
+    if (best_idle < 0 && tier == CAKE_TIER_0) {
+        s32 last = tctx->last_victim_cpu;
+        if (last >= 0 && last < CAKE_MAX_CPUS) {
+            struct cake_cpu_status *status = &cpu_status[last];
+            /* 
+             * Guard: Don't stick if it's Tier 6 (Game) or Tier 0 (Self)
+             * Only stick to Tiers 1-5 (Background/Batch)
+             */
+            if (status->tier >= CAKE_TIER_1 && status->tier <= CAKE_TIER_5) {
+                 /* CACHE-AWARE: Still check warmth! */
+                 if ((now - status->started_at) > 200000) {
+                     victim_cpu = last;
+                     /* Don't scan - we found our favorite victim */
+                     goto found_idle;
+                 }
+            }
         }
     }
 
@@ -504,7 +539,11 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
                 u8 v_tier = status->tier;
                 /* Preempt Tiers 1-5 */
                 if (v_tier >= CAKE_TIER_1 && v_tier <= CAKE_TIER_5) {
-                    victim_cpu = idx;
+                    /* CACHE-AWARE: Skip victim if it just started (<200us) */
+                    u64 started = status->started_at;
+                    if (now - started > 200000) {
+                        victim_cpu = idx;
+                    }
                 }
             }
         }
@@ -581,6 +620,11 @@ found_idle:
         
         /* Queue on victim CPU */
         cpu = victim_cpu;
+        
+        /* Update sticky victim (only for Tier 0) */
+        if (tier == CAKE_TIER_0) {
+            tctx->last_victim_cpu = victim_cpu;
+        }
     }
 
     return cpu;
@@ -771,13 +815,15 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         if (cpu_status[cpu].tier != tier) {
             cpu_status[cpu].tier = tier;
         }
+        /* Always update start time for cache-aware preemption */
+        cpu_status[cpu].started_at = now;
     }
 
     /* WAIT BUDGET CHECK (CAKE AQM) */
     if (tctx->last_wake_ts > 0) {
-        u32 now_ts = (u32)now;
-        /* Handle wrap-around (native u32 subtraction) */
-        u64 wait_time = (u64)(now_ts - tctx->last_wake_ts); /* Roughly * 1024 */
+        
+        /* Handle wrap-around (native u64 subtraction) */
+        u64 wait_time = now - tctx->last_wake_ts; /* Roughly * 1024 */
         
         /* 
          * OPTIMIZATION: Bitwise Decay on Long Sleep
@@ -869,7 +915,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         tctx->last_wake_ts = 0;
     }
 
-    tctx->last_run_at = (u32)now;
+    tctx->last_run_at = now;
 }
 
 /*
@@ -880,16 +926,14 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
     struct cake_task_ctx *tctx;
     /* OPTIMIZATION: scx_bpf_now() uses cached rq->clock */
     u64 now = scx_bpf_now();
-    u64 runtime;
 
     tctx = get_task_ctx(p);
     if (unlikely(!tctx || tctx->last_run_at == 0))
         return;
 
-    /* u32 automatic wrap handling for runtime */
-    u32 now_32 = (u32)now;
-    u32 runtime_32 = now_32 - tctx->last_run_at;
-    runtime = (u64)runtime_32;
+    /* u64 automatic wrap handling for runtime */
+    
+    u64 runtime = now - tctx->last_run_at;
     
     /* Update Kalman Filter Estimate (HFT Math) */
     update_kalman_estimate(tctx, runtime);
@@ -956,11 +1000,11 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 
     /* Check for starvation using tier-specific threshold */
     if (tctx->last_run_at > 0) {    /* Check for starvation */
-        /* Use u32 wrap-safe math: (u32)now - last_run_at */
+        /* Use u64 wrap-safe math: now - last_run_at */
         /* Only valid if we ran within 4 seconds, otherwise we assume starvation anyway */
         /* OPTIMIZATION: scx_bpf_now() uses cached rq->clock */
-        u32 runtime_32 = (u32)scx_bpf_now() - tctx->last_run_at;
-        u64 runtime = (u64)runtime_32;
+        
+        u64 runtime = scx_bpf_now() - tctx->last_run_at;
 
         u8 tier = GET_TIER(tctx);
         
@@ -1028,6 +1072,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
         }
         /* Initialize tier to Tier 6 default */
         cpu_status[i].tier = CAKE_TIER_6;
+        cpu_status[i].started_at = 0;
         bpf_rcu_read_unlock();
     }
 
