@@ -26,7 +26,12 @@ const volatile u64 quantum_ns = CAKE_DEFAULT_QUANTUM_NS;
 const volatile u64 new_flow_bonus_ns = CAKE_DEFAULT_NEW_FLOW_BONUS_NS;
 const volatile u64 sparse_threshold = CAKE_DEFAULT_SPARSE_THRESHOLD;
 const volatile u64 starvation_ns = CAKE_DEFAULT_STARVATION_NS;
-const volatile bool enable_stats = false;  /* Set to true when --verbose is used */
+
+#ifdef CAKE_DEBUG_STATS
+const volatile bool enable_stats = false;  /* Runtime toggle (volatile) */
+#else
+const bool enable_stats = false;           /* Compile-time constant (optimized out) */
+#endif
 
 /*
  * Global statistics (Per-CPU to avoid bus locking)
@@ -454,6 +459,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
      * - No atomics, no locks, pure memory loads.
      */
     s32 best_idle = -1;
+    s32 victim_cpu = -1; /* Unified Loop: Store victim for later */
     /* s32 nr_cpus = scx_bpf_nr_cpu_ids(); -- Optimized out */
 
     /* 1. Check Previous CPU (Sticky) */
@@ -463,30 +469,43 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         }
     }
 
-    /* 2. Linear Scan (Table-Driven) */
+    /* 2. Unified Linear Scan (Idle + Victim) */
     if (best_idle < 0) {
-        /* 
-         * Sanitize prev_cpu for array indexing.
-         * We use strict masking (AND 63) to force the compiler to emit a bound-limiting instruction
-         * that the BPF verifier can see. Checks like 'if (x > 63)' can be optimized in ways the verifier loses track of.
-         */
+        /* Sanitize prev_cpu */
         u32 safe_prev = (u32)prev_cpu & (CAKE_MAX_CPUS - 1);
 
         /*
-         * OPTIMIZATION: Pre-Computed Topology Scan
-         * Userspace generates the optimal search order for each CPU.
-         * Prioritizes: SMT -> LLC -> P-Cores -> CPPC Score
+         * OPTIMIZATION: Unified Topology Scan (Single Pass)
+         * We search for BOTH an Idle CPU and a potential Victim in one loop.
+         * - If Idle found: Take it immediately (Cheapest).
+         * - If Victim found: Remember it (Backup plan).
+         *
+         * UNROLL: Partial unroll (4) to save I-Cache.
          */
-        #pragma unroll
+        #pragma unroll 4
         for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
             s32 idx = (s32)scx_cake_scan_order[safe_prev][i];
 
-            /* Check valid range (0-63). 255 = Padding/Invalid */
+            /* Check valid range */
             if (idx >= CAKE_MAX_CPUS) continue;
 
-            if (cpu_status[idx].is_idle) {
+            /* Load status once (Cache Hot) */
+            struct cake_cpu_status *status = &cpu_status[idx];
+
+            /* Check for Idle (Priority #1) */
+            if (status->is_idle) {
                 best_idle = idx;
                 goto found_idle;
+            }
+
+            /* Check for Victim (Priority #2 - Only if we are Tier 0) */
+            /* We only need one victim, and neighbors are best (L3 Cache) */
+            if (tier == CAKE_TIER_0 && victim_cpu < 0) {
+                u8 v_tier = status->tier;
+                /* Preempt Tiers 1-5 */
+                if (v_tier >= CAKE_TIER_1 && v_tier <= CAKE_TIER_5) {
+                    victim_cpu = idx;
+                }
             }
         }
     }
@@ -515,74 +534,46 @@ found_idle:
      * Preemption Injection (Latency path)
      * If saturated, check if we can preempt a lower priority task.
      */
-    if (tier == CAKE_TIER_0) { /* Tier 0 only */
-        s32 victim_cpu = -1;
-
-        /* 
-         * OPTIMIZATION: Pre-Computed Topology Scan for Victim
+    /* 
+     * Preemption Injection (Latency path)
+     * If we didn't find an IDLE CPU, and we are Tier 0...
+     * check if our Single-Pass scan found a victim.
+     */
+    if (tier == CAKE_TIER_0 && victim_cpu >= 0) {
+        /*
+         * OPTIMIZATION: Hybrid Preemption (Safety + Speed)
+         *
+         * 1. Safety Net (Lazy): Always squash slice to 0.
+         *    Guarantees victim yields at next tick (max 1ms) if kick fails/skipped.
+         *    Cost: ~100 cycles (Free compared to 1ms wait).
          */
-        /* Sanitize prev_cpu via masking */
-        u32 safe_prev = (u32)prev_cpu & (CAKE_MAX_CPUS - 1);
+        bpf_rcu_read_lock();
+        struct task_struct *victim = scx_bpf_cpu_curr(victim_cpu);
+        if (victim) {
+            victim->scx.slice = 0;
+        }
+        bpf_rcu_read_unlock();
 
-        #pragma unroll
-        for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
-            s32 idx = (s32)scx_cake_scan_order[safe_prev][i];
+        /*
+         * 2. Speed (Active): Hardware Interrupt (Kick)
+         *    Forces immediate ~2us switch.
+         *    Rate-limited to every 50us to prevent IPI storms.
+         */
+        struct cake_cooldown_elem *cooldown = &cooldowns[victim_cpu];
+        u64 last_ts = *(volatile u64 *)&cooldown->last_preempt_ts;
+
+        if (now - last_ts > 75000) {
+            *(volatile u64 *)&cooldown->last_preempt_ts = now;
+            scx_bpf_kick_cpu(victim_cpu, SCX_KICK_PREEMPT);
             
-            /* Check valid range */
-            if (idx >= CAKE_MAX_CPUS) continue;
-
-            /* 
-             * Preemption Matrix:
-             * Preemptor: Tier 0 ONLY
-             * Victim: Tiers 1-5
-             * Protected: Tier 0, Tier 6
-             */
-            u8 v_tier = cpu_status[idx].tier;
-            if (v_tier >= CAKE_TIER_1 && v_tier <= CAKE_TIER_5) {
-                victim_cpu = idx;
-                goto found_victim;
+            if (enable_stats) {
+                struct cake_stats *s = get_local_stats();
+                if (s) s->nr_input_preempts++;
             }
         }
-
         
-found_victim:
-        /* Did we find a victim? */
-        if (victim_cpu >= 0) {
-            /*
-             * OPTIMIZATION: Hybrid Preemption (Safety + Speed)
-             *
-             * 1. Safety Net (Lazy): Always squash slice to 0.
-             *    Guarantees victim yields at next tick (max 1ms) if kick fails/skipped.
-             *    Cost: ~100 cycles (Free compared to 1ms wait).
-             */
-            bpf_rcu_read_lock();
-            struct task_struct *victim = scx_bpf_cpu_curr(victim_cpu);
-            if (victim) {
-                victim->scx.slice = 0;
-            }
-            bpf_rcu_read_unlock();
-
-            /*
-             * 2. Speed (Active): Hardware Interrupt (Kick)
-             *    Forces immediate ~2us switch.
-             *    Rate-limited to every 50us to prevent IPI storms.
-             */
-            struct cake_cooldown_elem *cooldown = &cooldowns[victim_cpu];
-            u64 last_ts = *(volatile u64 *)&cooldown->last_preempt_ts;
-
-            if (now - last_ts > 75000) {
-                *(volatile u64 *)&cooldown->last_preempt_ts = now;
-                scx_bpf_kick_cpu(victim_cpu, SCX_KICK_PREEMPT);
-                
-                if (enable_stats) {
-                    struct cake_stats *s = get_local_stats();
-                    if (s) s->nr_input_preempts++;
-                }
-            }
-            
-            /* Try to queue on victim CPU */
-            cpu = victim_cpu;
-        }
+        /* Queue on victim CPU */
+        cpu = victim_cpu;
     }
 
     return cpu;
@@ -704,51 +695,47 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
     /* Priority order: Tier 0 → Tier 1 → Tier 2 → Tier 3 → Tier 4 → Tier 5 → Tier 6 */
 
     /* Non-sharded high priority tiers */
-    if (scx_bpf_dsq_nr_queued(DSQ_0) && scx_bpf_dsq_move_to_local(DSQ_0))
-        return;
-    if (scx_bpf_dsq_nr_queued(DSQ_1) && scx_bpf_dsq_move_to_local(DSQ_1))
-        return;
-    if (scx_bpf_dsq_nr_queued(DSQ_2) && scx_bpf_dsq_move_to_local(DSQ_2))
-        return;
+    /* Non-sharded high priority tiers (0, 1, 2) - Compact Loop */
+    s32 i;
+    for (i = 0; i <= 2; i++) {
+        if (scx_bpf_dsq_nr_queued(DSQ_0 + i) && scx_bpf_dsq_move_to_local(DSQ_0 + i))
+            return;
+    }
 
     /*
      * Sharded Gaming Tier (Tier 3)
      * Check local shard first (cpu % mask), then scan others.
      * Loop unrolled by compiler (4 iterations).
      */
-    s32 i;
-    u64 base = DSQ_3;
-    /* Try local shard first for affinity */
-    u32 local_shard = cpu & SCX_DSQ_SHARD_MASK;
-    if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
-        return;
-
-    /* Scan other shards (Ring Scan: 1..3) */
-    #pragma unroll
-    for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
-        u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
-        if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
-            return;
-    }
-
+    /* s32 i; already defined above */
     /*
-     * Sharded Interactive Tier (Tier 4)
+     * Sharded Tiers (Tier 3 Gaming, Tier 4 Interactive) - Compact Loop
+     * Use common logic for both, iterating base addresses.
      */
-    base = DSQ_4;
-    if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
-        return;
-    #pragma unroll
-    for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
-        u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
-        if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
+    u64 base;
+    for (base = DSQ_3; base <= DSQ_4; base += SCX_DSQ_SHARD_COUNT) {
+        /* Try local shard first for affinity */
+        u32 local_shard = cpu & SCX_DSQ_SHARD_MASK;
+        if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
             return;
+
+        /* Scan other shards (Ring Scan: 1..3) */
+        /* UNROLL: 4 iterations is small enough to keep fully unrolled for speed */
+        #pragma unroll
+        for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
+            u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
+            if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
+                return;
+        }
     }
 
     /* Non-sharded low priority tiers */
-    if (scx_bpf_dsq_nr_queued(DSQ_5) && scx_bpf_dsq_move_to_local(DSQ_5))
-        return;
-    if (scx_bpf_dsq_nr_queued(DSQ_6))
-        scx_bpf_dsq_move_to_local(DSQ_6);
+    /* Non-sharded low priority tiers (5, 6) - Compact Loop */
+    u64 dsq;
+    for (dsq = DSQ_5; dsq <= DSQ_6; dsq++) {
+        if (scx_bpf_dsq_nr_queued(dsq) && scx_bpf_dsq_move_to_local(dsq))
+            return;
+    }
 }
 
 /*

@@ -24,6 +24,9 @@ scx_utils = { git = "https://github.com/sched-ext/scx", branch = "main" }
 [build-dependencies]
 scx_cargo = { git = "https://github.com/sched-ext/scx", branch = "main" }
 
+[features]
+debug_stats = []
+
 [[bin]]
 name = "scx_cake"
 path = "src/main.rs"

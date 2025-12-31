@@ -4,7 +4,11 @@
 
 fn main() {
     // Force BPF v4 instruction set for better code density and 32-bit ALU support
-    std::env::set_var("BPF_EXTRA_CFLAGS_PRE_INCL", "-O3 -mcpu=v4");
+    let mut cflags = String::from("-O3 -mcpu=v4");
+    if std::env::var("CARGO_FEATURE_DEBUG_STATS").is_ok() {
+        cflags.push_str(" -DCAKE_DEBUG_STATS");
+    }
+    std::env::set_var("BPF_EXTRA_CFLAGS_PRE_INCL", &cflags);
 
     scx_cargo::BpfBuilder::new()
         .unwrap()
