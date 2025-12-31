@@ -8,7 +8,8 @@ pub const MAX_CPUS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct CpuInfo {
     pub id: usize,
-    pub physical_package_id: usize, // CCD/Socket
+    pub physical_package_id: usize, // Socket
+    pub l3_cache_id: usize,         // CCD/CCX (Shared L3)
     pub _core_id: usize,            // Physical Core (unused)
     pub smt_siblings: Vec<usize>,
     pub max_freq_khz: u32,
@@ -38,6 +39,23 @@ impl Topology {
             let core_id = read_int(&cpu_dir.join("topology/core_id")).unwrap_or(0);
             let max_freq = read_int(&cpu_dir.join("cpufreq/scaling_max_freq")).unwrap_or(0) as u32;
             let cppc_perf = read_int(&cpu_dir.join("acpi_cppc/highest_perf")).unwrap_or(0) as u32;
+            
+            // Detect L3 Cache ID
+            // Scan cpuN/cache/index* for level=3
+            let mut l3_cache_id = phys_pkg; // Fallback to socket ID if no L3 found
+            for idx in 0..4 {
+                let cache_dir = cpu_dir.join(format!("cache/index{}", idx));
+                if !cache_dir.exists() { continue; }
+                
+                if let Some(level) = read_int(&cache_dir.join("level")) {
+                    if level == 3 {
+                        if let Some(id) = read_int(&cache_dir.join("id")) {
+                            l3_cache_id = id;
+                            break;
+                        }
+                    }
+                }
+            }
 
             // SMT siblings detection
             let mut smt_siblings = Vec::new();
@@ -48,6 +66,7 @@ impl Topology {
             cpus.push(CpuInfo {
                 id: i,
                 physical_package_id: phys_pkg as usize,
+                l3_cache_id: l3_cache_id as usize,
                 _core_id: core_id as usize,
                 smt_siblings,
                 max_freq_khz: max_freq,
@@ -68,7 +87,12 @@ impl Topology {
             }
         }
 
-        info!("Detected {} CPUs. Dual-CCD/Hybrid awareness enabled.", cpus.len());
+        // Check for multiple L3s to log helpful info
+        let mut l3_ids: Vec<usize> = cpus.iter().map(|c| c.l3_cache_id).collect();
+        l3_ids.sort();
+        l3_ids.dedup();
+        
+        info!("Detected {} CPUs. Dual-CCD/Hybrid awareness enabled. Found {} L3 Cache Domains.", cpus.len(), l3_ids.len());
         Ok(Self { cpus })
     }
 
@@ -78,9 +102,9 @@ impl Topology {
         for (_i, cpu) in self.cpus.iter().enumerate() {
             // Priority List for CPU[i]:
             // 1. SMT Siblings (Fastest Context Switch/Cache sharing)
-            // 2. Same CCD, P-Cores, High CPPC
-            // 3. Same CCD, P-Cores, Low CPPC
-            // 4. Same CCD, E-Cores
+            // 2. Same L3 Cache (CCD), P-Cores, High CPPC
+            // 3. Same L3 Cache (CCD), P-Cores, Low CPPC
+            // 4. Same L3 Cache (CCD), E-Cores
             // 5. Remote CCD, P-Cores...
             // 6. ...
             
@@ -89,11 +113,12 @@ impl Topology {
                 .collect();
 
             neighbors.sort_by(|a, b| {
-                // Priority 1: Same CCD? (L3 Cache)
-                let a_same_ccd = a.physical_package_id == cpu.physical_package_id;
-                let b_same_ccd = b.physical_package_id == cpu.physical_package_id;
-                if a_same_ccd != b_same_ccd {
-                    return b_same_ccd.cmp(&a_same_ccd); // True first
+                // Priority 1: Same L3 Cache? (Lowest Latency Inter-core)
+                // This replaces the old physical_package_id check which was too broad for multi-CCD single-socket.
+                let a_same_l3 = a.l3_cache_id == cpu.l3_cache_id;
+                let b_same_l3 = b.l3_cache_id == cpu.l3_cache_id;
+                if a_same_l3 != b_same_l3 {
+                    return b_same_l3.cmp(&a_same_l3); // True first
                 }
 
                 // Priority 2: P-Core?
@@ -130,13 +155,13 @@ impl Topology {
     }
 
     pub fn check_features(&self) -> (bool, bool) {
-        let mut package_ids = Vec::new();
+        let mut l3_ids = Vec::new();
         for cpu in &self.cpus {
-            if !package_ids.contains(&cpu.physical_package_id) {
-                package_ids.push(cpu.physical_package_id);
+            if !l3_ids.contains(&cpu.l3_cache_id) {
+                l3_ids.push(cpu.l3_cache_id);
             }
         }
-        let is_dual_ccd = package_ids.len() > 1;
+        let is_dual_ccd = l3_ids.len() > 1;
 
         let is_hybrid = self.cpus.iter().any(|c| !c.is_p_core);
 
