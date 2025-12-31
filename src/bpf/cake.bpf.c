@@ -143,21 +143,21 @@ static const u32 tier_multiplier[8] = {
  * 
  * Formula: Starvation = 2x Wait Budget (consistent ratio)
  */
-#define WAIT_BUDGET_CRITICAL_LATENCY 100000    /* 100µs - ultra-tight for input */
-#define WAIT_BUDGET_REALTIME    750000    /* 750µs */
-#define WAIT_BUDGET_CRITICAL    2000000   /* 2ms */
-#define WAIT_BUDGET_GAMING      4000000   /* 4ms */
-#define WAIT_BUDGET_INTERACTIVE 8000000   /* 8ms */
-#define WAIT_BUDGET_BATCH       20000000  /* 20ms */
+#define WAIT_BUDGET_DSQ_0       100000    /* 100µs - ultra-tight for input */
+#define WAIT_BUDGET_DSQ_1       750000    /* 750µs */
+#define WAIT_BUDGET_DSQ_2       2000000   /* 2ms */
+#define WAIT_BUDGET_DSQ_3       4000000   /* 4ms */
+#define WAIT_BUDGET_DSQ_4       8000000   /* 8ms */
+#define WAIT_BUDGET_DSQ_5       20000000  /* 20ms */
 
 /* Array for O(1) wait budget lookup. PADDED TO 8 for Branchless Access (tier & 7). */
 static const u64 wait_budget[8] = {
-    WAIT_BUDGET_CRITICAL_LATENCY, /* Tier 0: 100µs */
-    WAIT_BUDGET_REALTIME,    /* Tier 1: 750µs */
-    WAIT_BUDGET_CRITICAL,    /* Tier 2: 2ms */
-    WAIT_BUDGET_GAMING,      /* Tier 3: 4ms */
-    WAIT_BUDGET_INTERACTIVE, /* Tier 4: 8ms */
-    WAIT_BUDGET_BATCH,       /* Tier 5: 20ms */
+    WAIT_BUDGET_DSQ_0,       /* Tier 0: 100µs */
+    WAIT_BUDGET_DSQ_1,       /* Tier 1: 750µs */
+    WAIT_BUDGET_DSQ_2,       /* Tier 2: 2ms */
+    WAIT_BUDGET_DSQ_3,       /* Tier 3: 4ms */
+    WAIT_BUDGET_DSQ_4,       /* Tier 4: 8ms */
+    WAIT_BUDGET_DSQ_5,       /* Tier 5: 20ms */
     0,                       /* Tier 6: no limit */
     0,                       /* PADDING: Entry 7 (Safe) */
 };
@@ -168,24 +168,24 @@ static const u64 wait_budget[8] = {
  * 
  * Formula: Starvation = 2x Wait Budget (except Background which has generous limit)
  */
-#define STARVATION_CRITICAL_LATENCY 5000000  /* 5ms - 2x wait budget */
-#define STARVATION_REALTIME     3000000    /* 3ms - 2x wait budget */
-#define STARVATION_CRITICAL     4000000    /* 4ms - 2x wait budget */
-#define STARVATION_GAMING       8000000    /* 8ms - 2x wait budget */
-#define STARVATION_INTERACTIVE  16000000   /* 16ms - 2x wait budget */
-#define STARVATION_BATCH        40000000   /* 40ms - 2x wait budget */
-#define STARVATION_BACKGROUND   100000000  /* 100ms - generous for bulk work */
+#define STARVATION_DSQ_0        5000000    /* 5ms - Safety Net */
+#define STARVATION_DSQ_1        3000000    /* 3ms - 2x wait budget */
+#define STARVATION_DSQ_2        4000000    /* 4ms - 2x wait budget */
+#define STARVATION_DSQ_3        8000000    /* 8ms - 2x wait budget (Allow 16ms frame spikes) */
+#define STARVATION_DSQ_4        16000000   /* 16ms - 2x wait budget */
+#define STARVATION_DSQ_5        40000000   /* 40ms - 2x wait budget (Throughput) */
+#define STARVATION_DSQ_6        100000000  /* 100ms - Longest leash */
 
 /* Array for O(1) starvation threshold lookup. PADDED TO 8 for Branchless Access (tier & 7). */
 static const u64 starvation_threshold[8] = {
-    STARVATION_CRITICAL_LATENCY, /* Tier 0: Critical Latency - 5ms */
-    STARVATION_REALTIME,     /* Tier 1: Realtime - 1.5ms */
-    STARVATION_CRITICAL,     /* Tier 2: Critical - 4ms */
-    STARVATION_GAMING,       /* Tier 3: Gaming - 8ms */
-    STARVATION_INTERACTIVE,  /* Tier 4: Interactive - 16ms */
-    STARVATION_BATCH,        /* Tier 5: Batch - 40ms */
-    STARVATION_BACKGROUND,   /* Tier 6: Background - 100ms */
-    STARVATION_BACKGROUND,   /* PADDING: Entry 7 (Safe) */
+    STARVATION_DSQ_0,        /* Tier 0: Critical Latency - 5ms */
+    STARVATION_DSQ_1,        /* Tier 1: Realtime - 1.5ms */
+    STARVATION_DSQ_2,        /* Tier 2: Critical - 4ms */
+    STARVATION_DSQ_3,        /* Tier 3: Gaming - 8ms */
+    STARVATION_DSQ_4,        /* Tier 4: Interactive - 16ms */
+    STARVATION_DSQ_5,        /* Tier 5: Batch - 40ms */
+    STARVATION_DSQ_6,        /* Tier 6: Background - 100ms */
+    STARVATION_DSQ_6,        /* PADDING: Entry 7 (Safe) */
 };
 
 
@@ -547,6 +547,13 @@ found_idle:
          *    Guarantees victim yields at next tick (max 1ms) if kick fails/skipped.
          *    Cost: ~100 cycles (Free compared to 1ms wait).
          */
+        /*
+         * OPTIMIZATION: Hybrid Preemption (Safety + Speed)
+         *
+         * 1. Safety Net (Lazy): Always squash slice to 0.
+         *    Guarantees victim yields at next tick (max 1ms) if kick fails/skipped.
+         *    Cost: ~100 cycles (Free compared to 1ms wait).
+         */
         bpf_rcu_read_lock();
         struct task_struct *victim = scx_bpf_cpu_curr(victim_cpu);
         if (victim) {
@@ -562,7 +569,7 @@ found_idle:
         struct cake_cooldown_elem *cooldown = &cooldowns[victim_cpu];
         u64 last_ts = *(volatile u64 *)&cooldown->last_preempt_ts;
 
-        if (now - last_ts > 75000) {
+        if (now - last_ts > 50000) {  /* 50us Rate Limit */
             *(volatile u64 *)&cooldown->last_preempt_ts = now;
             scx_bpf_kick_cpu(victim_cpu, SCX_KICK_PREEMPT);
             
