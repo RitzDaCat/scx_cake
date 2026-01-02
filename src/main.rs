@@ -67,6 +67,7 @@ struct Args {
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     args: Args,
+    topo_summary: topology::TopologySummary,
 }
 
 impl<'a> Scheduler<'a> {
@@ -103,8 +104,10 @@ impl<'a> Scheduler<'a> {
             // Actually 255 is our sentinal.
         });
         
-        let (is_dual_ccd, is_hybrid) = topo.check_features();
-        info!("Topology: Dual CCD: {}, Hybrid P & E: {}", is_dual_ccd, is_hybrid);
+        let topo_summary = topo.summary();
+        info!("Topology: {} CPUs, {} cores, {} L3 domains, SMT: {}, Hybrid: {}", 
+              topo_summary.num_cpus, topo_summary.num_cores, topo_summary.num_l3_domains,
+              topo_summary.has_smt, topo_summary.is_hybrid);
 
         let scan_order = topo.generate_scan_order();
         let smt_siblings = topo.generate_smt_siblings();
@@ -125,7 +128,7 @@ impl<'a> Scheduler<'a> {
             warn!("Failed to access BPF .bss data - topology scan disabled");
         }
 
-        Ok(Self { skel, args })
+        Ok(Self { skel, args, topo_summary })
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -144,7 +147,7 @@ impl<'a> Scheduler<'a> {
 
         if self.args.verbose {
             // Run TUI mode
-            tui::run_tui(&mut self.skel, shutdown.clone(), self.args.interval)?;
+            tui::run_tui(&mut self.skel, shutdown.clone(), self.args.interval, &self.topo_summary)?;
         } else {
             // Silent mode - just wait for shutdown
             while !shutdown.load(Ordering::Relaxed) {

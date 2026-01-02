@@ -118,6 +118,7 @@ struct cake_stats {
     u64 nr_new_flow_dispatches;    /* Tasks dispatched from new-flow */
     u64 nr_old_flow_dispatches;    /* Tasks dispatched from old-flow */
     u64 nr_tier_dispatches[CAKE_TIER_MAX]; /* Per-tier dispatch counts */
+    u64 nr_shard_dispatches[CAKE_TIER_MAX][SCX_DSQ_SHARD_COUNT]; /* Per-tier per-shard dispatch counts */
     u64 nr_sparse_promotions;      /* Sparse flow promotions */
     u64 nr_sparse_demotions;       /* Sparse flow demotions */
     u64 nr_wait_demotions;         /* Tier demotions due to wait budget violation */

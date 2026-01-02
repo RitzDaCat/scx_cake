@@ -8,13 +8,26 @@ pub const MAX_CPUS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct CpuInfo {
     pub id: usize,
-    pub physical_package_id: usize, // Socket
+    pub _physical_package_id: usize, // Socket (unused directly, used via summary)
     pub l3_cache_id: usize,         // CCD/CCX (Shared L3)
     pub _core_id: usize,            // Physical Core (unused)
     pub smt_siblings: Vec<usize>,
     pub max_freq_khz: u32,
     pub cppc_perf: u32,             // 0 if unsupported
     pub is_p_core: bool,
+}
+
+/// Summary of detected CPU topology for display
+#[derive(Debug, Clone)]
+pub struct TopologySummary {
+    pub num_cpus: usize,
+    pub num_cores: usize,       // Physical cores (CPUs / 2 if SMT)
+    pub num_sockets: usize,
+    pub num_l3_domains: usize,  // CCDs/CCXs
+    pub has_smt: bool,
+    pub is_hybrid: bool,        // Has E-cores
+    pub max_freq_mhz: u32,
+    pub has_cppc: bool,
 }
 
 pub struct Topology {
@@ -65,7 +78,7 @@ impl Topology {
 
             cpus.push(CpuInfo {
                 id: i,
-                physical_package_id: phys_pkg as usize,
+                _physical_package_id: phys_pkg as usize,
                 l3_cache_id: l3_cache_id as usize,
                 _core_id: core_id as usize,
                 smt_siblings,
@@ -195,18 +208,47 @@ impl Topology {
         l3_ids
     }
 
-    pub fn check_features(&self) -> (bool, bool) {
-        let mut l3_ids = Vec::new();
-        for cpu in &self.cpus {
-            if !l3_ids.contains(&cpu.l3_cache_id) {
-                l3_ids.push(cpu.l3_cache_id);
-            }
-        }
-        let is_dual_ccd = l3_ids.len() > 1;
-
+    /// Generate a summary of the topology for display
+    pub fn summary(&self) -> TopologySummary {
+        let num_cpus = self.cpus.len();
+        
+        // Count unique sockets
+        let mut sockets: Vec<usize> = self.cpus.iter().map(|c| c._physical_package_id).collect();
+        sockets.sort();
+        sockets.dedup();
+        let num_sockets = sockets.len();
+        
+        // Count unique L3 domains (CCDs)
+        let mut l3_ids: Vec<usize> = self.cpus.iter().map(|c| c.l3_cache_id).collect();
+        l3_ids.sort();
+        l3_ids.dedup();
+        let num_l3_domains = l3_ids.len();
+        
+        // Check for SMT (any CPU has siblings)
+        let has_smt = self.cpus.iter().any(|c| !c.smt_siblings.is_empty());
+        
+        // Count physical cores (if SMT, divide by 2)
+        let num_cores = if has_smt { num_cpus / 2 } else { num_cpus };
+        
+        // Check for hybrid (E-cores)
         let is_hybrid = self.cpus.iter().any(|c| !c.is_p_core);
-
-        (is_dual_ccd, is_hybrid)
+        
+        // Max frequency
+        let max_freq_mhz = self.cpus.iter().map(|c| c.max_freq_khz).max().unwrap_or(0) / 1000;
+        
+        // Check for CPPC support
+        let has_cppc = self.cpus.iter().any(|c| c.cppc_perf > 0);
+        
+        TopologySummary {
+            num_cpus,
+            num_cores,
+            num_sockets,
+            num_l3_domains,
+            has_smt,
+            is_hybrid,
+            max_freq_mhz,
+            has_cppc,
+        }
     }
 }
 

@@ -655,6 +655,21 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     /* Zero-Cycle Wakeup: Tier already calculated in cake_stopping */
     tier = GET_TIER(tctx);
 
+    /*
+     * OPTIMIZATION: Look up base DSQ from table
+     * All tiers are now sharded equally.
+     */
+    dsq_id = tier_to_dsq_base[tier & 7];
+
+    /* 
+     * OPTIMIZATION: Stochastic Sharding for All Tiers
+     * Distribute tasks across shards to reduce DSQ lock contention.
+     * Use (pid ^ cpu) for stateless distribution.
+     */
+    u32 hash = (p->pid ^ bpf_get_smp_processor_id());
+    u32 shard = hash & SCX_DSQ_SHARD_MASK;
+    dsq_id += shard;
+
     /* Track if this is a wakeup (new flow) or preemption (old flow) */
     if (enable_stats) {
         struct cake_stats *s = get_local_stats();
@@ -671,35 +686,14 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
              * tier & 0x7 ensures max value is 7 (CAKE_TIER_MAX-1 = 6)
              */
             u8 bounded_tier = tier & 0x7;
-            if (bounded_tier < CAKE_TIER_MAX)
+            if (bounded_tier < CAKE_TIER_MAX) {
                 s->nr_tier_dispatches[bounded_tier]++;
+                /* Track per-shard dispatches */
+                if (shard < SCX_DSQ_SHARD_COUNT)
+                    s->nr_shard_dispatches[bounded_tier][shard]++;
+            }
         }
     }
-
-    /*
-     * Route to DSQ based on tier classification:
-     * - DSQ_0: True input handlers
-     * - DSQ_1: score=100, longer runtime
-     * - DSQ_2: audio, compositor
-     * - DSQ_3: sparse/bursty tasks
-     * - DSQ_4: normal applications
-     * - DSQ_5: nice > 0
-     * - DSQ_6: bulk work
-     */
-
-    /*
-     * OPTIMIZATION: Look up base DSQ from table
-     * All tiers are now sharded equally.
-     */
-    dsq_id = tier_to_dsq_base[tier & 7];
-
-    /* 
-     * OPTIMIZATION: Stochastic Sharding for All Tiers
-     * Distribute tasks across shards to reduce DSQ lock contention.
-     * Use (pid ^ cpu) for stateless distribution.
-     */
-    u32 hash = (p->pid ^ bpf_get_smp_processor_id());
-    dsq_id += (hash & SCX_DSQ_SHARD_MASK);
 
     /*
      * OPTIMIZATION: Zero-Cycle Slice (Pre-Computed)

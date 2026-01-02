@@ -23,7 +23,8 @@ use ratatui::{
 
 use crate::bpf_skel::types::cake_stats;
 use crate::bpf_skel::BpfSkel;
-use crate::stats::TIER_NAMES;
+use crate::stats::{TIER_NAMES, SHARD_COUNT};
+use crate::topology::TopologySummary;
 use libbpf_rs::{MapFlags, MapCore};
 
 fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
@@ -59,7 +60,7 @@ fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
         total.nr_new_flow_dispatches += s.nr_new_flow_dispatches;
         total.nr_old_flow_dispatches += s.nr_old_flow_dispatches;
         
-        for i in 0..crate::stats::TIER_NAMES.len() {
+        for i in 0..TIER_NAMES.len() {
             total.nr_tier_dispatches[i] += s.nr_tier_dispatches[i];
             total.nr_wait_demotions_tier[i] += s.nr_wait_demotions_tier[i];
             total.nr_starvation_preempts_tier[i] += s.nr_starvation_preempts_tier[i];
@@ -68,6 +69,10 @@ fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
             // Max is max, not sum
             if s.max_wait_ns_tier[i] > total.max_wait_ns_tier[i] {
                 total.max_wait_ns_tier[i] = s.max_wait_ns_tier[i];
+            }
+            // Sum per-shard dispatches
+            for sh in 0..SHARD_COUNT {
+                total.nr_shard_dispatches[i][sh] += s.nr_shard_dispatches[i][sh];
             }
         }
         
@@ -161,14 +166,15 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
     output.push_str(&format!("=== scx_cake Statistics (Uptime: {}) ===\n\n", uptime));
     output.push_str(&format!("Dispatches: {} total ({:.1}% new-flow)\n\n", total_dispatches, new_pct));
     
-    output.push_str("Tier           Dispatches    Max Wait    WaitDemote  StarvPreempt\n");
-    output.push_str("─────────────────────────────────────────────────────────────────\n");
+    output.push_str("DSQ      Dispatches    Max Wait    WaitDemote  StarvPreempt  Shard0   Shard1\n");
+    output.push_str("──────────────────────────────────────────────────────────────────────────────\n");
     for (i, name) in TIER_NAMES.iter().enumerate() {
         let max_wait_us = stats.max_wait_ns_tier[i] / 1000;
         output.push_str(&format!(
-            "{:12}   {:>10}    {:>6} µs    {:>10}  {:>12}\n",
+            "{:6}   {:>10}    {:>6} µs    {:>10}  {:>12}  {:>7}  {:>7}\n",
             name, stats.nr_tier_dispatches[i], max_wait_us,
-            stats.nr_wait_demotions_tier[i], stats.nr_starvation_preempts_tier[i]
+            stats.nr_wait_demotions_tier[i], stats.nr_starvation_preempts_tier[i],
+            stats.nr_shard_dispatches[i][0], stats.nr_shard_dispatches[i][1]
         ));
     }
     
@@ -182,15 +188,17 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
 }
 
 /// Draw the UI
-fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
+fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats, topo: &TopologySummary) {
     let area = frame.area();
 
-    // Create main layout: header, stats table, footer
+    // Create main layout: header, topology info, stats table, shard usage, summary, footer
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // Header
-            Constraint::Min(10),    // Stats table
+            Constraint::Length(3),  // Topology info
+            Constraint::Length(10), // Stats table
+            Constraint::Length(5),  // Shard usage
             Constraint::Length(5),  // Summary
             Constraint::Length(3),  // Footer
         ])
@@ -215,8 +223,25 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
             .border_style(Style::default().fg(Color::Blue)));
     frame.render_widget(header, layout[0]);
 
+    // --- Topology Info ---
+    let smt_str = if topo.has_smt { "SMT" } else { "No SMT" };
+    let hybrid_str = if topo.is_hybrid { ", Hybrid" } else { "" };
+    let cppc_str = if topo.has_cppc { ", CPPC" } else { "" };
+    let topo_text = format!(
+        " {} CPUs ({} cores) │ {} socket(s) │ {} L3/CCDs │ {} MHz │ {}{}{}",
+        topo.num_cpus, topo.num_cores, topo.num_sockets, topo.num_l3_domains,
+        topo.max_freq_mhz, smt_str, hybrid_str, cppc_str
+    );
+    let topo_widget = Paragraph::new(topo_text)
+        .style(Style::default().fg(Color::White))
+        .block(Block::default()
+            .title(" CPU Topology ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)));
+    frame.render_widget(topo_widget, layout[1]);
+
     // --- Stats Table ---
-    let header_cells = ["Tier", "Dispatches", "Max Wait", "WaitDemote", "StarvPreempt"]
+    let header_cells = ["DSQ", "Dispatches", "Max Wait", "WaitDemote", "StarvPreempt"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header_row = Row::new(header_cells).height(1);
@@ -240,7 +265,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
@@ -249,10 +274,44 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     )
     .header(header_row)
     .block(Block::default()
-        .title(" Per-Tier Statistics ")
+        .title(" Per-DSQ Statistics ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue)));
-    frame.render_widget(table, layout[1]);
+    frame.render_widget(table, layout[2]);
+
+    // --- Shard Usage ---
+    // Build a compact view: DSQ0[S0:xxx S1:xxx] DSQ1[S0:xxx S1:xxx] ...
+    let mut shard_lines: Vec<String> = Vec::new();
+    
+    // First line: DSQ0-3
+    let mut line1_parts: Vec<String> = Vec::new();
+    for i in 0..4 {
+        let s0 = stats.nr_shard_dispatches[i][0];
+        let s1 = stats.nr_shard_dispatches[i][1];
+        let total = s0 + s1;
+        let pct0 = if total > 0 { (s0 as f64 / total as f64 * 100.0) as u32 } else { 50 };
+        line1_parts.push(format!("{}[{}%:{}%]", TIER_NAMES[i], pct0, 100 - pct0));
+    }
+    shard_lines.push(format!(" {}", line1_parts.join("  ")));
+    
+    // Second line: DSQ4-6
+    let mut line2_parts: Vec<String> = Vec::new();
+    for i in 4..7 {
+        let s0 = stats.nr_shard_dispatches[i][0];
+        let s1 = stats.nr_shard_dispatches[i][1];
+        let total = s0 + s1;
+        let pct0 = if total > 0 { (s0 as f64 / total as f64 * 100.0) as u32 } else { 50 };
+        line2_parts.push(format!("{}[{}%:{}%]", TIER_NAMES[i], pct0, 100 - pct0));
+    }
+    shard_lines.push(format!(" {}", line2_parts.join("  ")));
+    
+    let shard_text = shard_lines.join("\n");
+    let shard_widget = Paragraph::new(shard_text)
+        .block(Block::default()
+            .title(" Shard Balance (S0%:S1%) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)));
+    frame.render_widget(shard_widget, layout[3]);
 
     // --- Summary ---
     let avg_wait_us = if stats.nr_waits > 0 {
@@ -273,7 +332,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
             .title(" Summary ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)));
-    frame.render_widget(summary, layout[2]);
+    frame.render_widget(summary, layout[4]);
 
     // --- Footer (key bindings + status) ---
     let footer_text = match app.get_status() {
@@ -290,19 +349,19 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
         .block(Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color)));
-    frame.render_widget(footer, layout[3]);
+    frame.render_widget(footer, layout[5]);
 }
 
-/// Get color style for a tier
+/// Get color style for a DSQ tier
 fn tier_style(tier: usize) -> Style {
     match tier {
-        0 => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),   // CritLatency - highest priority
-        1 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),    // Realtime
-        2 => Style::default().fg(Color::Magenta),                              // Critical
-        3 => Style::default().fg(Color::Green),                                // Gaming
-        4 => Style::default().fg(Color::Yellow),                               // Interactive
-        5 => Style::default().fg(Color::Blue),                                 // Batch
-        6 => Style::default().fg(Color::DarkGray),                             // Background
+        0 => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),   // DSQ0 - highest priority
+        1 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),    // DSQ1
+        2 => Style::default().fg(Color::Magenta),                              // DSQ2
+        3 => Style::default().fg(Color::Green),                                // DSQ3
+        4 => Style::default().fg(Color::Yellow),                               // DSQ4
+        5 => Style::default().fg(Color::Blue),                                 // DSQ5
+        6 => Style::default().fg(Color::DarkGray),                             // DSQ6 - lowest priority
         _ => Style::default(),
     }
 }
@@ -312,6 +371,7 @@ pub fn run_tui(
     skel: &mut BpfSkel,
     shutdown: Arc<AtomicBool>,
     interval_secs: u64,
+    topo: &TopologySummary,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = TuiApp::new();
@@ -339,7 +399,7 @@ pub fn run_tui(
         };
 
         // Draw UI
-        terminal.draw(|frame| draw_ui(frame, &app, &stats))?;
+        terminal.draw(|frame| draw_ui(frame, &app, &stats, topo))?;
 
         // Handle events with timeout
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
