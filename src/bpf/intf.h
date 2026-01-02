@@ -76,7 +76,8 @@ struct cake_task_ctx {
     u16 avg_runtime_us;    /* 2B: HFT Kalman Estimate */
     s32 last_victim_cpu;   /* 4B: NEW: Sticky Victim (The Bully Strategy) */
     u8 preferred_l3;       /* 1B: Preferred L3/CCX for affinity (255 = unset) */
-    u8 __pad[27];          /* 28 -> 27 bytes (Total 64) */
+    u8 last_shard;         /* 1B: Last dispatched shard (for latency tracking) */
+    u8 __pad[26];          /* 28 -> 26 bytes (Total 64) */
 };
 
 /* Bitfield Offsets for packed_info */
@@ -131,6 +132,15 @@ struct cake_stats {
     u64 total_wait_ns_tier[CAKE_TIER_MAX];  /* Sum of wait times per tier */
     u64 nr_waits_tier[CAKE_TIER_MAX];       /* Number of waits per tier */
     u64 max_wait_ns_tier[CAKE_TIER_MAX];    /* Max wait time per tier */
+    /* 
+     * Per-tier per-shard latency tracking
+     * Arrays sized to 8 (not CAKE_TIER_MAX=7) so tier & 0x7 is always valid.
+     * This satisfies BPF verifier which tracks mask ranges (0-7), not conditional ranges.
+     * Index 7 is unused padding - small cost for verifier compatibility.
+     */
+    u64 total_wait_ns_shard[8][SCX_DSQ_SHARD_COUNT];  /* Sum of wait times per shard */
+    u64 nr_waits_shard[8][SCX_DSQ_SHARD_COUNT];       /* Number of waits per shard */
+    u64 max_wait_ns_shard[8][SCX_DSQ_SHARD_COUNT];    /* Max wait time per shard */
     u64 nr_input_preempts;                 /* Preemptions injected for input/latency */
 };
 

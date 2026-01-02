@@ -670,6 +670,9 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     u32 shard = hash & SCX_DSQ_SHARD_MASK;
     dsq_id += shard;
 
+    /* Save shard for per-shard latency tracking in running() */
+    tctx->last_shard = (u8)shard;
+
     /* Track if this is a wakeup (new flow) or preemption (old flow) */
     if (enable_stats) {
         struct cake_stats *s = get_local_stats();
@@ -833,13 +836,31 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
             if (wait_time > stats->max_wait_ns)
                 stats->max_wait_ns = wait_time;
             
-            /* Per-tier stats */
-            if (tier < CAKE_TIER_MAX) {
-                stats->total_wait_ns_tier[tier] += wait_time;
-                stats->nr_waits_tier[tier]++;
-                if (wait_time > stats->max_wait_ns_tier[tier])
-                    stats->max_wait_ns_tier[tier] = wait_time;
+            /* 
+             * Per-tier and per-shard stats
+             * tier bounded by mask (& 0x7) gives 0-7
+             * shard bounded by mask (& SCX_DSQ_SHARD_MASK) gives 0-1
+             * 
+             * Per-tier arrays are size CAKE_TIER_MAX (7), need conditional check.
+             * Per-shard arrays are padded to size 8, so tier & 0x7 always valid.
+             */
+            u8 bounded_tier = tier & 0x7;
+            if (bounded_tier < CAKE_TIER_MAX) {
+                stats->total_wait_ns_tier[bounded_tier] += wait_time;
+                stats->nr_waits_tier[bounded_tier]++;
+                if (wait_time > stats->max_wait_ns_tier[bounded_tier])
+                    stats->max_wait_ns_tier[bounded_tier] = wait_time;
             }
+            
+            /* 
+             * Per-shard latency - arrays padded to [8][2] so mask is sufficient.
+             * No conditional needed since tier=7 is valid index (unused padding).
+             */
+            u8 shard = tctx->last_shard & SCX_DSQ_SHARD_MASK;
+            stats->total_wait_ns_shard[bounded_tier][shard] += wait_time;
+            stats->nr_waits_shard[bounded_tier][shard]++;
+            if (wait_time > stats->max_wait_ns_shard[bounded_tier][shard])
+                stats->max_wait_ns_shard[bounded_tier][shard] = wait_time;
         }
         
 

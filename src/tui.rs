@@ -70,9 +70,14 @@ fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
             if s.max_wait_ns_tier[i] > total.max_wait_ns_tier[i] {
                 total.max_wait_ns_tier[i] = s.max_wait_ns_tier[i];
             }
-            // Sum per-shard dispatches
+            // Sum per-shard dispatches and latency
             for sh in 0..SHARD_COUNT {
                 total.nr_shard_dispatches[i][sh] += s.nr_shard_dispatches[i][sh];
+                total.total_wait_ns_shard[i][sh] += s.total_wait_ns_shard[i][sh];
+                total.nr_waits_shard[i][sh] += s.nr_waits_shard[i][sh];
+                if s.max_wait_ns_shard[i][sh] > total.max_wait_ns_shard[i][sh] {
+                    total.max_wait_ns_shard[i][sh] = s.max_wait_ns_shard[i][sh];
+                }
             }
         }
         
@@ -162,19 +167,31 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
         0
     };
 
+    // Helper to format avg latency in µs per shard
+    let avg_lat_us = |tier: usize, shard: usize| -> u64 {
+        if stats.nr_waits_shard[tier][shard] > 0 {
+            (stats.total_wait_ns_shard[tier][shard] / stats.nr_waits_shard[tier][shard]) / 1000
+        } else {
+            0
+        }
+    };
+
     let mut output = String::new();
     output.push_str(&format!("=== scx_cake Statistics (Uptime: {}) ===\n\n", uptime));
     output.push_str(&format!("Dispatches: {} total ({:.1}% new-flow)\n\n", total_dispatches, new_pct));
     
-    output.push_str("DSQ      Dispatches    Max Wait    WaitDemote  StarvPreempt  Shard0   Shard1\n");
-    output.push_str("──────────────────────────────────────────────────────────────────────────────\n");
+    output.push_str("DSQ      Dispatches    Max Wait    WaitDemote  StarvPreempt  Shard0   Shard1   S0 Lat   S1 Lat\n");
+    output.push_str("────────────────────────────────────────────────────────────────────────────────────────────────\n");
     for (i, name) in TIER_NAMES.iter().enumerate() {
         let max_wait_us = stats.max_wait_ns_tier[i] / 1000;
+        let lat0 = avg_lat_us(i, 0);
+        let lat1 = avg_lat_us(i, 1);
         output.push_str(&format!(
-            "{:6}   {:>10}    {:>6} µs    {:>10}  {:>12}  {:>7}  {:>7}\n",
+            "{:6}   {:>10}    {:>6} µs    {:>10}  {:>12}  {:>7}  {:>7}  {:>5} µs {:>5} µs\n",
             name, stats.nr_tier_dispatches[i], max_wait_us,
             stats.nr_wait_demotions_tier[i], stats.nr_starvation_preempts_tier[i],
-            stats.nr_shard_dispatches[i][0], stats.nr_shard_dispatches[i][1]
+            stats.nr_shard_dispatches[i][0], stats.nr_shard_dispatches[i][1],
+            lat0, lat1
         ));
     }
     
@@ -198,7 +215,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats, topo: &TopologyS
             Constraint::Length(3),  // Header
             Constraint::Length(3),  // Topology info
             Constraint::Length(10), // Stats table
-            Constraint::Length(5),  // Shard usage
+            Constraint::Length(7),  // Shard usage with latency (4 lines + borders)
             Constraint::Length(5),  // Summary
             Constraint::Length(3),  // Footer
         ])
@@ -279,11 +296,20 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats, topo: &TopologyS
         .border_style(Style::default().fg(Color::Blue)));
     frame.render_widget(table, layout[2]);
 
-    // --- Shard Usage ---
-    // Build a compact view: DSQ0[S0:xxx S1:xxx] DSQ1[S0:xxx S1:xxx] ...
+    // --- Shard Usage with Latency ---
+    // Build a compact view showing balance and avg latency per shard
     let mut shard_lines: Vec<String> = Vec::new();
     
-    // First line: DSQ0-3
+    // Helper to format avg latency in µs
+    let avg_lat_us = |tier: usize, shard: usize| -> u64 {
+        if stats.nr_waits_shard[tier][shard] > 0 {
+            (stats.total_wait_ns_shard[tier][shard] / stats.nr_waits_shard[tier][shard]) / 1000
+        } else {
+            0
+        }
+    };
+    
+    // First line: DSQ0-3 with balance percentages
     let mut line1_parts: Vec<String> = Vec::new();
     for i in 0..4 {
         let s0 = stats.nr_shard_dispatches[i][0];
@@ -294,7 +320,16 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats, topo: &TopologyS
     }
     shard_lines.push(format!(" {}", line1_parts.join("  ")));
     
-    // Second line: DSQ4-6
+    // Second line: DSQ0-3 latencies (avg µs per shard)
+    let mut lat1_parts: Vec<String> = Vec::new();
+    for i in 0..4 {
+        let lat0 = avg_lat_us(i, 0);
+        let lat1 = avg_lat_us(i, 1);
+        lat1_parts.push(format!("    {}µs:{}µs", lat0, lat1));
+    }
+    shard_lines.push(format!(" {}", lat1_parts.join(" ")));
+    
+    // Third line: DSQ4-6 with balance percentages
     let mut line2_parts: Vec<String> = Vec::new();
     for i in 4..7 {
         let s0 = stats.nr_shard_dispatches[i][0];
@@ -305,10 +340,19 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats, topo: &TopologyS
     }
     shard_lines.push(format!(" {}", line2_parts.join("  ")));
     
+    // Fourth line: DSQ4-6 latencies (avg µs per shard)
+    let mut lat2_parts: Vec<String> = Vec::new();
+    for i in 4..7 {
+        let lat0 = avg_lat_us(i, 0);
+        let lat1 = avg_lat_us(i, 1);
+        lat2_parts.push(format!("    {}µs:{}µs", lat0, lat1));
+    }
+    shard_lines.push(format!(" {}", lat2_parts.join(" ")));
+    
     let shard_text = shard_lines.join("\n");
     let shard_widget = Paragraph::new(shard_text)
         .block(Block::default()
-            .title(" Shard Balance (S0%:S1%) ")
+            .title(" Shard Balance & Latency (S0:S1) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)));
     frame.render_widget(shard_widget, layout[3]);
