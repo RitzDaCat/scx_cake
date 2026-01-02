@@ -46,10 +46,10 @@ enum cake_tier {
 
 /*
  * DSQ Sharding
- * Number of shards per sharded tier (Tier 3, Tier 4).
+ * Number of shards per tier (all tiers use equal sharding).
  * Must be a power of 2 for fast masking.
  */
-#define SCX_DSQ_SHARD_COUNT 4
+#define SCX_DSQ_SHARD_COUNT 2
 #define SCX_DSQ_SHARD_MASK  (SCX_DSQ_SHARD_COUNT - 1)
 
 /*
@@ -75,7 +75,8 @@ struct cake_task_ctx {
     u16 deficit_us;        /* 2B: NEW: Deficit (us), max 65ms */
     u16 avg_runtime_us;    /* 2B: HFT Kalman Estimate */
     s32 last_victim_cpu;   /* 4B: NEW: Sticky Victim (The Bully Strategy) */
-    u8 __pad[28];          /* 32 -> 28 bytes (Total 64) */
+    u8 preferred_l3;       /* 1B: Preferred L3/CCX for affinity (255 = unset) */
+    u8 __pad[27];          /* 28 -> 27 bytes (Total 64) */
 };
 
 /* Bitfield Offsets for packed_info */
@@ -103,7 +104,9 @@ struct cake_task_ctx {
 struct cake_cpu_status {
     u8 is_idle;            /* 1B: 1 if idle, 0 if busy */
     u8 tier;               /* 1B: Current running tier */
-    u8 __pad_0[6];         /* Align u64 */
+    u8 smt_sibling;        /* 1B: SMT sibling CPU ID (255 = none) */
+    u8 l3_id;              /* 1B: L3 cache / CCX ID */
+    u8 __pad_0[4];         /* Align u64 */
     u64 started_at;        /* 8B: NEW: Timestamp of current slice start */
     u8 __pad[48];          /* 62 -> 48 bytes (Total 64) */
 };

@@ -101,43 +101,49 @@ impl Topology {
 
         for (_i, cpu) in self.cpus.iter().enumerate() {
             // Priority List for CPU[i]:
-            // 1. SMT Siblings (Fastest Context Switch/Cache sharing)
-            // 2. Same L3 Cache (CCD), P-Cores, High CPPC
-            // 3. Same L3 Cache (CCD), P-Cores, Low CPPC
-            // 4. Same L3 Cache (CCD), E-Cores
-            // 5. Remote CCD, P-Cores...
-            // 6. ...
+            // Key insight: For partial load, we want PHYSICAL CORES before HT siblings
+            // to avoid sharing execution resources with busy cores.
+            //
+            // NEW Priority Order:
+            // 1. Same L3, Non-SMT (same CCD, different physical core) - best cache + no contention
+            // 2. Remote L3, Non-SMT, High CPPC (different CCD but full core) - for fast cores
+            // 3. Same L3, SMT sibling (only if physical cores exhausted)
+            // 4. Remote L3, SMT siblings (last resort)
+            //
+            // This ensures we spread across physical cores first, then use HT.
             
             let mut neighbors: Vec<&CpuInfo> = self.cpus.iter()
                 .filter(|c| c.id != cpu.id) // Don't include self
                 .collect();
 
             neighbors.sort_by(|a, b| {
-                // Priority 1: Same L3 Cache? (Lowest Latency Inter-core)
-                // This replaces the old physical_package_id check which was too broad for multi-CCD single-socket.
-                let a_same_l3 = a.l3_cache_id == cpu.l3_cache_id;
-                let b_same_l3 = b.l3_cache_id == cpu.l3_cache_id;
-                if a_same_l3 != b_same_l3 {
-                    return b_same_l3.cmp(&a_same_l3); // True first
-                }
-
-                // Priority 2: P-Core?
-                if a.is_p_core != b.is_p_core {
-                    return b.is_p_core.cmp(&a.is_p_core); // P-Core first
-                }
-
-                // Priority 3: AVOID SMT Siblings (Physical Cores First)
-                // We want to fill physical cores before using hyperthreads.
+                // Priority 1: AVOID SMT Siblings (Physical Cores First!)
+                // This is now TOP priority to prevent HT sibling preference.
+                // An SMT sibling shares execution resources - bad for partial load.
                 let a_is_smt = cpu.smt_siblings.contains(&a.id);
                 let b_is_smt = cpu.smt_siblings.contains(&b.id);
                 if a_is_smt != b_is_smt {
                     return a_is_smt.cmp(&b_is_smt); // False (Not SMT) first!
                 }
 
-                // Priority 4: CPPC Perf (Golden Core)
-                // Use descending order (Higher is better)
+                // Priority 2: Same L3 Cache? (Lowest Latency Inter-core)
+                // Among non-SMT cores, prefer same CCD for cache locality.
+                let a_same_l3 = a.l3_cache_id == cpu.l3_cache_id;
+                let b_same_l3 = b.l3_cache_id == cpu.l3_cache_id;
+                if a_same_l3 != b_same_l3 {
+                    return b_same_l3.cmp(&a_same_l3); // True first
+                }
+
+                // Priority 3: CPPC Perf (Golden Core / Fast Core)
+                // Higher CPPC = better single-thread performance.
+                // This helps use fastest cores when lightly loaded.
                 if a.cppc_perf != b.cppc_perf {
-                    return b.cppc_perf.cmp(&a.cppc_perf);
+                    return b.cppc_perf.cmp(&a.cppc_perf); // Higher first
+                }
+
+                // Priority 4: P-Core?
+                if a.is_p_core != b.is_p_core {
+                    return b.is_p_core.cmp(&a.is_p_core); // P-Core first
                 }
 
                 // Fallback: stable sort by ID
@@ -152,6 +158,41 @@ impl Topology {
         }
 
         table
+    }
+
+    /// Generate SMT sibling map for each CPU
+    /// Returns array where index is CPU ID and value is its SMT sibling (255 = none)
+    pub fn generate_smt_siblings(&self) -> [u8; MAX_CPUS] {
+        let mut siblings = [255u8; MAX_CPUS];
+        
+        for cpu in &self.cpus {
+            if cpu.id >= MAX_CPUS {
+                continue;
+            }
+            // Take first SMT sibling (if any)
+            if let Some(&sibling) = cpu.smt_siblings.first() {
+                if sibling < MAX_CPUS {
+                    siblings[cpu.id] = sibling as u8;
+                }
+            }
+        }
+        
+        siblings
+    }
+    
+    /// Generate L3 cache ID map for each CPU (for CCX affinity)
+    /// Returns array where index is CPU ID and value is its L3 cache ID
+    pub fn generate_l3_ids(&self) -> [u8; MAX_CPUS] {
+        let mut l3_ids = [0u8; MAX_CPUS];
+        
+        for cpu in &self.cpus {
+            if cpu.id >= MAX_CPUS {
+                continue;
+            }
+            l3_ids[cpu.id] = cpu.l3_cache_id as u8;
+        }
+        
+        l3_ids
     }
 
     pub fn check_features(&self) -> (bool, bool) {

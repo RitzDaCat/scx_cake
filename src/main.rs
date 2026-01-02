@@ -107,10 +107,20 @@ impl<'a> Scheduler<'a> {
         info!("Topology: Dual CCD: {}, Hybrid P & E: {}", is_dual_ccd, is_hybrid);
 
         let scan_order = topo.generate_scan_order();
+        let smt_siblings = topo.generate_smt_siblings();
+        let l3_ids = topo.generate_l3_ids();
         
         // Write to BSS map
         if let Some(bss) = skel.maps.bss_data.as_mut() {
-            bss.scx_cake_scan_order = scan_order; 
+            bss.scx_cake_scan_order = scan_order;
+            
+            // Initialize topology info in cpu_status array
+            for cpu_id in 0..topology::MAX_CPUS {
+                if cpu_id < bss.cpu_status.len() {
+                    bss.cpu_status[cpu_id].smt_sibling = smt_siblings[cpu_id];
+                    bss.cpu_status[cpu_id].l3_id = l3_ids[cpu_id];
+                }
+            }
         } else {
             warn!("Failed to access BPF .bss data - topology scan disabled");
         }

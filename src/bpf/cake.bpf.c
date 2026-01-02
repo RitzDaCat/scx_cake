@@ -92,16 +92,16 @@ static u64 cached_threshold_ns;
  * - DSQ_6:  Bulk tasks (compilers, encoders) - lowest priority
  *
  * SHARDING OPTIMIZATION:
- * Tier 3 and Tier 4 are sharded (SCX_DSQ_SHARD_COUNT = 4).
- * We reserve ID space for them.
+ * All tiers use equal sharding (SCX_DSQ_SHARD_COUNT = 2).
+ * Total DSQs: 7 tiers * 2 shards = 14 queues.
  */
-#define DSQ_0 0
-#define DSQ_1    1
-#define DSQ_2    2
-#define DSQ_3      3                             /* Base: 3, 4, 5, 6 */
-#define DSQ_4 (DSQ_3 + SCX_DSQ_SHARD_COUNT)     /* Base: 7, 8, 9, 10 */
-#define DSQ_5       (DSQ_4 + SCX_DSQ_SHARD_COUNT) /* 11 */
-#define DSQ_6  (DSQ_5 + 1)               /* 12 */
+#define DSQ_0 0                                  /* Base: 0, 1 */
+#define DSQ_1 (DSQ_0 + SCX_DSQ_SHARD_COUNT)      /* Base: 2, 3 */
+#define DSQ_2 (DSQ_1 + SCX_DSQ_SHARD_COUNT)      /* Base: 4, 5 */
+#define DSQ_3 (DSQ_2 + SCX_DSQ_SHARD_COUNT)      /* Base: 6, 7 */
+#define DSQ_4 (DSQ_3 + SCX_DSQ_SHARD_COUNT)      /* Base: 8, 9 */
+#define DSQ_5 (DSQ_4 + SCX_DSQ_SHARD_COUNT)      /* Base: 10, 11 */
+#define DSQ_6 (DSQ_5 + SCX_DSQ_SHARD_COUNT)      /* Base: 12, 13 */
 
 /* Mapping from Tier ID (0-6) to Base DSQ ID */
 static const u64 tier_to_dsq_base[8] = {
@@ -263,6 +263,7 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p)
     ctx->last_wake_ts = 0;
     ctx->avg_runtime_us = 0;
     ctx->last_victim_cpu = -1; /* Initialize sticky victim */
+    ctx->preferred_l3 = 255;   /* Unset - will be set on first run */
     
     /* Pack initial values: Err=255, Score=50, Tier=Tier 4, Flags=New */
     u32 packed = 0;
@@ -476,10 +477,11 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         goto found_idle;
     }
 
-    /* 1. Check Previous CPU (Sticky) */
+    /* 1. Remember prev_cpu preference (but don't commit yet) */
+    s32 prev_cpu_idle = -1;
     if (prev_cpu >= 0 && prev_cpu < CAKE_MAX_CPUS) {
         if (cpu_status[prev_cpu].is_idle) {
-            best_idle = prev_cpu;
+            prev_cpu_idle = prev_cpu;
         }
     }
 
@@ -504,48 +506,52 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         }
     }
 
-    /* 2. Unified Linear Scan (Idle + Victim) */
-    if (best_idle < 0) {
+    /* 2. Topology-Ordered Scan - Trust the pre-computed scan order */
+    {
         /* Sanitize prev_cpu */
         u32 safe_prev = (u32)prev_cpu & (CAKE_MAX_CPUS - 1);
 
         /*
-         * OPTIMIZATION: Unified Topology Scan (Single Pass)
-         * We search for BOTH an Idle CPU and a potential Victim in one loop.
-         * - If Idle found: Take it immediately (Cheapest).
-         * - If Victim found: Remember it (Backup plan).
-         *
-         * UNROLL: Partial unroll (4) to save I-Cache.
+         * SIMPLIFIED: The scan order table already handles:
+         * 1. Non-SMT cores first (physical cores before HT siblings)
+         * 2. Same L3 (CCX) for cache locality
+         * 3. High CPPC (faster cores)
+         * 
+         * So we just find the first idle CPU in order.
+         * This keeps the BPF program under the instruction limit.
          */
-        #pragma unroll 4
+        
         for (u32 i = 0; i < CAKE_MAX_CPUS; i++) {
             s32 idx = (s32)scx_cake_scan_order[safe_prev][i];
 
-            /* Check valid range */
-            if (idx >= CAKE_MAX_CPUS) continue;
+            /* Check valid range - end of list */
+            if (idx >= CAKE_MAX_CPUS) break;
 
-            /* Load status once (Cache Hot) */
+            /* Load status once */
             struct cake_cpu_status *status = &cpu_status[idx];
 
-            /* Check for Idle (Priority #1) */
+            /* Take first idle CPU (scan order already prioritizes correctly) */
             if (status->is_idle) {
                 best_idle = idx;
                 goto found_idle;
             }
 
-            /* Check for Victim (Priority #2 - Only if we are Tier 0) */
-            /* We only need one victim, and neighbors are best (L3 Cache) */
+            /* Check for Victim (Only Tier 0 tasks preempt) */
             if (tier == CAKE_TIER_0 && victim_cpu < 0) {
                 u8 v_tier = status->tier;
-                /* Preempt Tiers 1-5 */
+                /* Preempt Tiers 1-5 (not Tier 0 or Tier 6) */
                 if (v_tier >= CAKE_TIER_1 && v_tier <= CAKE_TIER_5) {
-                    /* CACHE-AWARE: Skip victim if it just started (<200us) */
-                    u64 started = status->started_at;
-                    if (now - started > 200000) {
+                    /* Skip if just started (<200us) */
+                    if (now - status->started_at > 200000) {
                         victim_cpu = idx;
                     }
                 }
             }
+        }
+        
+        /* Fallback to prev_cpu if it was idle and scan found nothing */
+        if (best_idle < 0 && prev_cpu_idle >= 0) {
+            best_idle = prev_cpu_idle;
         }
     }
 
@@ -683,19 +689,17 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 
     /*
      * OPTIMIZATION: Look up base DSQ from table
-     * This handles the gaps caused by sharding.
+     * All tiers are now sharded equally.
      */
     dsq_id = tier_to_dsq_base[tier & 7];
 
     /* 
-     * OPTIMIZATION: Stochastic Sharding for High-Traffic Tiers
+     * OPTIMIZATION: Stochastic Sharding for All Tiers
      * Distribute tasks across shards to reduce DSQ lock contention.
      * Use (pid ^ cpu) for stateless distribution.
      */
-    if (tier == CAKE_TIER_3 || tier == CAKE_TIER_4) {
-        u32 hash = (p->pid ^ bpf_get_smp_processor_id());
-        dsq_id += (hash & SCX_DSQ_SHARD_MASK);
-    }
+    u32 hash = (p->pid ^ bpf_get_smp_processor_id());
+    dsq_id += (hash & SCX_DSQ_SHARD_MASK);
 
     /*
      * OPTIMIZATION: Zero-Cycle Slice (Pre-Computed)
@@ -735,56 +739,35 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
      * system jitter (cache misses, interrupts).
      * XOR with PID to scatter. Avoids helper overhead of prandom.
      */
+    u32 local_shard = cpu & SCX_DSQ_SHARD_MASK;
+    
     if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
         /* Give background a chance even if others have work */
-        if (scx_bpf_dsq_nr_queued(DSQ_6) && scx_bpf_dsq_move_to_local(DSQ_6))
+        /* Check both shards of Tier 6 */
+        if (scx_bpf_dsq_nr_queued(DSQ_6 + local_shard) && scx_bpf_dsq_move_to_local(DSQ_6 + local_shard))
             return;
-        if (scx_bpf_dsq_nr_queued(DSQ_4) && scx_bpf_dsq_move_to_local(DSQ_4))
+        if (scx_bpf_dsq_nr_queued(DSQ_6 + (1 - local_shard)) && scx_bpf_dsq_move_to_local(DSQ_6 + (1 - local_shard)))
             return;
     }
     
-    /* Priority order: Tier 0 → Tier 1 → Tier 2 → Tier 3 → Tier 4 → Tier 5 → Tier 6 */
-
-    /* Non-sharded high priority tiers */
-    /* Non-sharded high priority tiers (0, 1, 2) - Compact Loop */
-    s32 i;
-    for (i = 0; i <= 2; i++) {
-        if (scx_bpf_dsq_nr_queued(DSQ_0 + i) && scx_bpf_dsq_move_to_local(DSQ_0 + i))
-            return;
-    }
-
     /*
-     * Sharded Gaming Tier (Tier 3)
-     * Check local shard first (cpu % mask), then scan others.
-     * Loop unrolled by compiler (4 iterations).
+     * Priority order: Tier 0 → Tier 1 → Tier 2 → Tier 3 → Tier 4 → Tier 5 → Tier 6
+     * All tiers now have equal sharding (2 shards each).
+     * For each tier: check local shard first, then other shard.
      */
-    /* s32 i; already defined above */
-    /*
-     * Sharded Tiers (Tier 3 Gaming, Tier 4 Interactive) - Compact Loop
-     * Use common logic for both, iterating base addresses.
-     */
-    u64 base;
-    for (base = DSQ_3; base <= DSQ_4; base += SCX_DSQ_SHARD_COUNT) {
+    static const u64 tier_bases[7] = { DSQ_0, DSQ_1, DSQ_2, DSQ_3, DSQ_4, DSQ_5, DSQ_6 };
+    
+    s32 t;
+    for (t = 0; t < 7; t++) {
+        u64 base = tier_bases[t];
+        
         /* Try local shard first for affinity */
-        u32 local_shard = cpu & SCX_DSQ_SHARD_MASK;
         if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
             return;
-
-        /* Scan other shards (Ring Scan: 1..3) */
-        /* UNROLL: 4 iterations is small enough to keep fully unrolled for speed */
-        #pragma unroll
-        for (i = 1; i < SCX_DSQ_SHARD_COUNT; i++) {
-            u32 target = (local_shard + i) & SCX_DSQ_SHARD_MASK;
-            if (scx_bpf_dsq_nr_queued(base + target) && scx_bpf_dsq_move_to_local(base + target))
-                return;
-        }
-    }
-
-    /* Non-sharded low priority tiers */
-    /* Non-sharded low priority tiers (5, 6) - Compact Loop */
-    u64 dsq;
-    for (dsq = DSQ_5; dsq <= DSQ_6; dsq++) {
-        if (scx_bpf_dsq_nr_queued(dsq) && scx_bpf_dsq_move_to_local(dsq))
+        
+        /* Try other shard */
+        u32 other_shard = 1 - local_shard;
+        if (scx_bpf_dsq_nr_queued(base + other_shard) && scx_bpf_dsq_move_to_local(base + other_shard))
             return;
     }
 }
@@ -817,6 +800,12 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         }
         /* Always update start time for cache-aware preemption */
         cpu_status[cpu].started_at = now;
+        
+        /* Update task's preferred L3/CCX for affinity */
+        u8 cpu_l3 = cpu_status[cpu].l3_id;
+        if (tctx->preferred_l3 != cpu_l3) {
+            tctx->preferred_l3 = cpu_l3;
+        }
     }
 
     /* WAIT BUDGET CHECK (CAKE AQM) */
@@ -1076,38 +1065,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
         bpf_rcu_read_unlock();
     }
 
-    /* Create all 7 dispatch queues in priority order */
-    ret = scx_bpf_create_dsq(DSQ_0, -1);
-    if (ret < 0)
-        return ret;
-
-    ret = scx_bpf_create_dsq(DSQ_1, -1);
-    if (ret < 0)
-        return ret;
-
-    ret = scx_bpf_create_dsq(DSQ_2, -1);
-    if (ret < 0)
-        return ret;
-
-    /* Create Sharded Tier 3 DSQs */
-    for (s32 i = 0; i < SCX_DSQ_SHARD_COUNT; i++) {
-        ret = scx_bpf_create_dsq(DSQ_3 + i, -1);
-        if (ret < 0) return ret;
+    /* Create all dispatch queues: 7 tiers * 2 shards = 14 DSQs */
+    static const u64 tier_bases[7] = { DSQ_0, DSQ_1, DSQ_2, DSQ_3, DSQ_4, DSQ_5, DSQ_6 };
+    
+    for (s32 t = 0; t < 7; t++) {
+        for (s32 s = 0; s < SCX_DSQ_SHARD_COUNT; s++) {
+            ret = scx_bpf_create_dsq(tier_bases[t] + s, -1);
+            if (ret < 0) return ret;
+        }
     }
-
-    /* Create Sharded Tier 4 DSQs */
-    for (s32 i = 0; i < SCX_DSQ_SHARD_COUNT; i++) {
-        ret = scx_bpf_create_dsq(DSQ_4 + i, -1);
-        if (ret < 0) return ret;
-    }
-
-    ret = scx_bpf_create_dsq(DSQ_5, -1);
-    if (ret < 0)
-        return ret;
-
-    ret = scx_bpf_create_dsq(DSQ_6, -1);
-    if (ret < 0)
-        return ret;
 
     return 0;
 }
