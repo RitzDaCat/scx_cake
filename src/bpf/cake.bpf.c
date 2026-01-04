@@ -689,11 +689,13 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     u32 shard = hash & SCX_DSQ_SHARD_MASK;
     dsq_id += shard;
 
-    /* Save shard for per-shard latency tracking in running() */
-    tctx->last_shard = (u8)shard;
+    /* Shard saved only if stats enabled */
 
     /* Track if this is a wakeup (new flow) or preemption (old flow) */
     if (enable_stats) {
+        /* Save shard for per-shard latency tracking in running() */
+        tctx->last_shard = (u8)shard;
+
         struct cake_stats *s = get_local_stats();
         if (s) {
             if (enq_flags & SCX_ENQ_WAKEUP) {
@@ -832,15 +834,14 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         
         /* 
          * OPTIMIZATION: Bitwise Decay on TRUE Inactivity
-         * We check (now - last_run_at) to see how long since the task last ran.
-         * If > 1s, it means the task was Sleeping significantly (e.g. User AFK).
-         * We decay history to let it "prove itself" again quickly.
-         * (Using wait_time here would only check Queue Latency, which is wrong).
+         * Only perform decay if we actually have a runtime to decay.
          */
-        if (tctx->last_run_at > 0) {
-            u64 time_since_last_run = now - tctx->last_run_at;
-            if (time_since_last_run > 1000000000) {
-                tctx->avg_runtime_us >>= 1;
+        if (tctx->avg_runtime_us > 0) {
+            if (tctx->last_run_at > 0) {
+                u64 time_since_last_run = now - tctx->last_run_at;
+                if (time_since_last_run > 1000000000) {
+                    tctx->avg_runtime_us >>= 1;
+                }
             }
         }
 
@@ -906,14 +907,11 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 
         
         /* Re-pack and save */
+        /* Re-pack and save logic */
         if (checks >= 15) checks = 15;
         if (violations >= 15) violations = 15;
-        SET_WAIT_DATA(tctx, (violations << 4) | checks);
 
-        /* Check for demotion (Ratio > 25%) */
-        /* Since we don't have exact 'wait_checks' separate from sample loop, 
-           we rely on the 10-sample window reset */
-        
+        /* Check for demotion window (Every 10 checks) */
         if (checks >= 10 && tier < CAKE_TIER_6) {
             if (violations >= 3) { /* > 30% bad waits */
                 /* Penalize score to force drop */
@@ -921,21 +919,20 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
                 u32 penalized = (current_score > 10) ? current_score - 10 : 0;
                 SET_SPARSE_SCORE(tctx, penalized);
                 
-                /* Reset data */
-                SET_WAIT_DATA(tctx, 0);
-                
-                /* Reuse hoisted stats pointer - saves redundant lookup */
+                /* Reuse hoisted stats pointer */
                 if (stats) {
                     stats->nr_wait_demotions++;
                     if (tier < CAKE_TIER_MAX)
                         stats->nr_wait_demotions_tier[tier]++;
                 }
-            } else {
-                /* Good behavior - reset */
-                /* Reset data */
-                SET_WAIT_DATA(tctx, 0);
             }
+            /* Reset window */
+            checks = 0;
+            violations = 0;
         }
+
+        /* Single Write: Update Context */
+        SET_WAIT_DATA(tctx, (violations << 4) | checks);
         
         /* Clear last_wake_at to prevent double-counting if task runs again */
         tctx->last_wake_ts = 0;
@@ -973,13 +970,15 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
      * Saved ~30 cycles of pointless math.
      */
 
-    /* Update deficit (us) */
-    /* deficit is u16 (us), runtime is u64 (ns). Convert runtime to us (>> 10) */
-    u32 runtime_us = (u32)(runtime >> 10);
-    if (runtime_us < tctx->deficit_us)
-        tctx->deficit_us -= (u16)runtime_us;
-    else
-        tctx->deficit_us = 0;
+    /* Update deficit (us) - Conditionally */
+    if (tctx->deficit_us > 0) {
+        /* deficit is u16 (us), runtime is u64 (ns). Convert runtime to us (>> 10) */
+        u32 runtime_us = (u32)(runtime >> 10);
+        if (runtime_us < tctx->deficit_us)
+            tctx->deficit_us -= (u16)runtime_us;
+        else
+            tctx->deficit_us = 0;
+    }
 
     /* 
      * OPTIMIZATION: Calc Tier for Next Wakeup (Zero-Cycle Enqueue)
