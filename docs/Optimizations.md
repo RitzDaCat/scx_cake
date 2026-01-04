@@ -111,3 +111,49 @@ We use `SCX_DSQ_LOCAL` (FIFO) instead of RB-Trees or Vtime.
 Wait-Free algorithms guarantee that no thread can block another.
 *   In `scx_cake`, CPU 0 can update its state without ever waiting for CPU 1.
 *   This removes the "Convoy Effect" where one slow core stalls the entire scheduler.
+
+---
+
+## 6. Pass 2 & 3: Extreme Low Latency (ALU-focused)
+
+In January 2026, we conducted a rigorous "Zero-Cycle" audit of the top 3 hottest paths (`dispatch`, `select_cpu`, `enqueue`) and replaced memory/logic heavy operations with pure ALU instructions.
+
+### A. Math-Over-Memory (DSQ Mapping)
+**Context:** The scheduler maps Tiers (0-6) to DSQ IDs (0-13).
+**Before:** Constant Arrays in `.rodata`.
+```c
+static const u64 tier_to_dsq_base[] = { DSQ_0, DSQ_1, ... };
+// Code:
+dsq_id = tier_to_dsq_base[tier]; // LOAD (L1 Cache access, ~4-5 cycles)
+```
+**After:** Pure Bitwise Math.
+```c
+// Code:
+dsq_id = (u64)tier * SCX_DSQ_SHARD_COUNT; // SHIFT (ALU access, 1 cycle)
+```
+**Impact:**
+*   Eliminated 2 static arrays (64 bytes saved).
+*   Replaced Memory Load with ALU Shift.
+*   **Total Savings:** ~30 cycles per dispatch loop (7 iterations * 4 cycle load latency).
+
+### B. Linear Logic (Tier Multiplier)
+**Context:** Higher tiers get smaller slices. Tiers stepped by roughly 0.1x (102/1024).
+**Before:** Array Lookup `tier_multiplier[tier]`.
+**After:** Linear Formula `717 + (tier * 102)`.
+**Impact:** Replaced Memory Load with ADD+MUL. Saves 32 bytes of cache.
+
+### C. Loop Flattening (`cake_dispatch`)
+**Context:** The hottest loop in the system. Checks 7 tiers x 2 shards.
+**Optimizations:**
+1.  **Hoisted Invariant:** `other_shard = local ^ 1` moved outside the loop. (Saved 7 subtractions).
+2.  **Bitwise Composition:** Replaced `base + shard` (ADD) with `base | shard` (OR).
+3.  **Unrolling:** Added `#pragma unroll` to force the compiler to flatten the loop, eliminating branch prediction costs and counter overhead.
+**Impact:** Est. 15-20 cycles saved per dispatch call. Reduced input lag for waking tasks.
+
+### D. Conditional Logic (Medium-Hot Paths)
+**Context:** Functions like `cake_running` and `cake_stopping` run on every context switch.
+**Changes:**
+1.  **Running:** `if (avg > 0) decay();` -> Skips 64-bit Timestamp math for tasks that are already 0 (light tasks/mice).
+2.  **Running:** Coalesced `wait_data` writes into a single store instruction (avoiding double-write on demotion).
+3.  **Stopping:** `if (deficit > 0) update();` -> Skips subtraction and cache line dirtying for tasks that don't overrun their slice.
+**Impact:** Increases efficiency for "Good Citizen" tasks and reduces L1 Cache traffic.
