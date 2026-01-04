@@ -104,16 +104,11 @@ static u64 cached_threshold_ns;
 #define DSQ_6 (DSQ_5 + SCX_DSQ_SHARD_COUNT)      /* Base: 12, 13 */
 
 /* Mapping from Tier ID (0-6) to Base DSQ ID */
-static const u64 tier_to_dsq_base[8] = {
-    DSQ_0,
-    DSQ_1,
-    DSQ_2,
-    DSQ_3,
-    DSQ_4,
-    DSQ_5,
-    DSQ_6,
-    DSQ_6 /* Pad */
-};
+/* 
+ * OPTIMIZATION: Removed tier_to_dsq_base array.
+ * We now calculate DSQ ID mathematically: tier * SCX_DSQ_SHARD_COUNT.
+ * This saves 64 bytes of cache and replaces a Load with a Shift.
+ */
 
 /*
  * Tier quantum multipliers (fixed-point, 1024 = 1.0x)
@@ -678,7 +673,11 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
      * OPTIMIZATION: Look up base DSQ from table
      * All tiers are now sharded equally.
      */
-    dsq_id = tier_to_dsq_base[tier & 7];
+    /*
+     * OPTIMIZATION: Calculate base DSQ mathematically
+     * Replaces memory load with shift (tier * 2).
+     */
+    dsq_id = (u64)(tier & 7) * SCX_DSQ_SHARD_COUNT;
 
     /* 
      * OPTIMIZATION: Stochastic Sharding for All Tiers
@@ -773,11 +772,14 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
      * All tiers now have equal sharding (2 shards each).
      * For each tier: check local shard first, then other shard.
      */
-    static const u64 tier_bases[7] = { DSQ_0, DSQ_1, DSQ_2, DSQ_3, DSQ_4, DSQ_5, DSQ_6 };
-    
+    /* 
+     * Priority order: Tier 0 -> Tier 6
+     * OPTIMIZATION: Removed tier_bases array.
+     * Calculate base mathematically (t * 2). 
+     */
     s32 t;
     for (t = 0; t < 7; t++) {
-        u64 base = tier_bases[t];
+        u64 base = (u64)t * SCX_DSQ_SHARD_COUNT;
         
         /* Try local shard first for affinity */
         if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
