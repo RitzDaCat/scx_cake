@@ -1,0 +1,20 @@
+9800x3d CPU, 8 core, idle on Arc Raiders menu for 6 hours with scx_cake running for data.
+build is 1/3/26 nightly.
+
+=== scx_cake Statistics (Uptime: 5h 43m) ===
+
+Dispatches: 2977997258 total (82.3% new-flow)
+
+DSQ      Dispatches    Max Wait    WaitDemote  StarvPreempt  Shard0   Shard1   S0 Lat   S1 Lat
+────────────────────────────────────────────────────────────────────────────────────────────────
+DSQ0      258145822    282456 µs       7207750         59303  99656127  158489695     19 µs    19 µs
+DSQ1       47871213     10771 µs        109835           743  24833957  23037256     36 µs    35 µs
+DSQ2      109889393     10566 µs        762270           817  54143510  55745883     35 µs    32 µs
+DSQ3       68965950    164574 µs         66358           363  34585490  34380460     41 µs    41 µs
+DSQ4        8526033    183720 µs         45778            12  4291867  4234166     46 µs    46 µs
+DSQ5        3119086     46862 µs       1461015            36  1652698  1466388     46 µs    47 µs
+DSQ6       31491286    184008 µs             0         98362  16475810  15015476     27 µs    29 µs
+
+Sparse flow: +9594511 promotions, -9541735 demotions, 9653006 wait-demotes
+Input: 86658813 preempts fired
+Wait time: avg 26 µs, max 282456 µs

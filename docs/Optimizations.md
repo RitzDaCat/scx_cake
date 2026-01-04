@@ -1,109 +1,113 @@
-# Optimization Whitepaper: The "Zero-Cycle" Architecture
+# scx_cake Optimization Strategy & Design Decisions
 
-## Executive Summary
-This document outlines the optimization journey of `scx_cake`, transforming it from a standard BPF scheduler into a purpose-built gaming engine operating at the hardware limits of the CPU (~12 cycles per decision).
+This document details the architectural decisions and optimization strategies that transform `scx_cake` from a standard BPF scheduler into a high-performance gaming engine. Our goal is **Zero-Overhead** and **Wait-Free** execution.
 
-## 1. Architectural Philosophy: "Unfairness is a Feature"
-Standard Linux schedulers (EEVDF, CFS) prioritize **Fairness**. They ensure every task gets a turn, often preempting high-priority tasks to serve low-priority ones (Lag Compensation).
-*   **The Gaming Problem**: In gaming, "Fairness" manifests as "Input Lag". If the scheduler pauses your Mouse Thread to let a background compiler run, you miss your shot.
-*   **The `scx_cake` Solution**: We explicitly design for **Unfairness**.
-    *   **Input (Tier 0)** is allowed to preempt everything.
-    *   **Gaming (Tier 3)** is strictly protected from background noise.
-    *   **The Cost**: Background throughput suffers slightly.
-    *   **The Gain**: Input Latency drops to **2 microseconds**.
+## 1. Architectural Philosophy
 
-## 2. Core Optimizations
+### A. "Unfairness is a Feature"
+Standard schedulers (CFS, EEVDF) prioritize Fairness (Lag Compensation). In gaming, Fairness = Latency.
+*   **Our Design:** We explicitly design for Unfairness.
+*   **Tier 0 (Realtime):** Allowed to preempt anything.
+*   **Tier 3 (Gaming):** Protected from background noise (Strict isolation).
+*   **Result:** Input Latency drops to hardware limits (~2µs).
 
-### A. Zero-Cycle Enqueue
-**Problem**: Calculating a task's priority (Tier) and timeslice (Slice) during `enqueue` (wakeup) is expensive (~25 cycles).
-**Solution**: **Pre-Computation**.
-*   We moved all math to `cake_stopping` (the cooldown phase).
-*   When a task wakes up, we simply **Load** the pre-calculated Tier/Slice from memory.
-*   **Cost**: 25 cycles -> **2 cycles** (L1 Cache Hit).
-
-### B. Global Bitmask Search (O(1))
-**Problem**: Finding an idle core involved scanning a BPF Map or iterating through a CPU list (~300 cycles).
-**Solution**: **Global Variable Bitwise Ops**.
-*   We use a single `u64 idle_mask` in `.bss` (Global Memory).
-*   We use the `__builtin_ctzll` (Count Trailing Zeros) hardware instruction to find the first set bit.
-*   **Cost**: 300 cycles -> **5 cycles** (Load + TZCNT).
-
-### C. Dead Code Removal (Vtime)
-**Problem**: The codebase contained "Virtual Time" normalization logic for fairness, costing ~30 cycles per switch.
-**Solution**: **Deletion**.
-*   Since we use FIFO queues for gaming, Vtime sorting was unused overhead.
-*   **Cost**: 30 cycles -> **0 cycles**.
-
-## 3. The "Safety Valve" (Starvation Tuning)
-Unfairness requires policing. If an Input task is allowed to run forever, it will hang the system.
-*   **Initial Failure**: We set the Starvation Limit to **1ms**.
-    *   *Result*: 1% Low FPS dropped (180 -> 120). Legitimate heavy input frames were being kicked.
-*   **Correction**: Relaxed Limit to **5ms**.
-    *   *Result*: 1% Low FPS restored (185).
-*   **Lesson**: The goal is to catch **Abuse** (infinite loops, hangs), not **Work**. 5ms is the "Sweet Spot" that protects the game without punishing it.
-
-## 4. Final Performance Matrix
-
-| Metric | Baseline | Optimized | Improvement |
-| :--- | :--- | :--- | :--- |
-| **Scheduler Latency** | ~400 cycles | **~12 cycles** | **33x Faster** |
-| **Avg Wait Time** | ~15 µs | **2 µs** | **Near Zero** |
-| **Direct Dispatch** | 80% | **91.4%** | **+14%** |
-| **1% Low FPS** | 120 (Regression) | **185** | **Record High** |
-
-## Conclusion
-`scx_cake` is now a "Race Car". It lacks the creature comforts (fairness) of a sedan/server scheduler, but strictly for the purpose of pushing frames to a GPU, it is now operating at the theoretical limit of the memory bus.
+### B. "Zero-Cycle" Execution
+We strive to move all math and logic **out of the hot path**.
+*   **Hot Path:** `select_cpu`, `enqueue`, `dispatch` (Must be dumb data movers).
+*   **Cold Path:** `stopping` (Do the math here when the task is done).
 
 ---
 
-## 5. December 2025 Optimizations
+## 2. Data Structure Optimizations
 
-### A. `scx_bpf_now()` Timestamp Caching
-**Problem**: `bpf_ktime_get_ns()` reads the hardware TSC (~15-25 cycles) on every call.
-**Solution**: Replace with `scx_bpf_now()` which uses the cached `rq->clock`.
-*   **4 call sites replaced**: `cake_select_cpu`, `cake_running`, `cake_stopping`, `cake_tick`
-*   **Cost**: 60-100 cycles → **12-20 cycles** per task lifecycle
+### A. The Scoreboard (`cake_cpu_status`)
+**Problem:** Tracking global CPU state usually requires atomic bitmasks (`idle_mask`) or global locks. This causes cache thrashing on high core counts (False Sharing).
+**Solution:** A Distributed Wait-Free Array.
+*   **Structure:** `struct cake_cpu_status cpu_status[CAKE_MAX_CPUS]` in .bss.
+*   **Wait-Free Writer:** Each CPU writes *only* to its own index (`cpu_status[my_cpu]`). No locks needed.
+*   **Cache Isolation:** Each struct is **padded to 64 bytes** (cache line size).
+    *   *Result:* CPU 0 writing to its status never invalidates CPU 1's cache line.
+    *   *Cost:* Storage space (negligible). *Gain:* Zero bus locking.
 
-### B. Idle Path Streamlining
-**Problem**: When a CPU goes idle, we performed 3 operations:
-1. `idle_mask` atomic OR (required)
-2. `victim_mask` atomic AND (redundant)
-3. `cpu_tier_map` update (redundant)
-
-**Solution**: Remove operations 2 and 3.
-*   `idle_mask` is checked first in `cake_select_cpu`, so stale `victim_mask` is harmless
-*   `cake_running` updates the scoreboard when a task actually starts
-*   **Cost**: ~60 cycles → **5 cycles** per idle transition
-
-### C. Cache Line Isolation
-**Problem**: `idle_mask` and `victim_mask` were adjacent in `.bss`, causing cache line thrashing on multi-core systems.
-**Solution**: Added 56-byte padding (`__mask_pad[7]`) between them.
-*   **Result**: Prevents false sharing between atomic updates
+### B. Task Context Compression (`cake_task_ctx`)
+**Problem:** Task context consumes memory and cache bandwidth.
+**Solution:** Bit-packing and efficient layout.
+*   **Packed Info:** We pack Score, Tier, Flags, and Wait Data into a single `u32` bitfield.
+*   **Result:** The critical hot-path data fits into the first 32 bytes (half a cache line).
 
 ---
 
-## 6. Research Findings & Industry Patterns
+## 3. Critical Path Optimizations (Hot Path)
 
-### Confirmed Best Practices (Already Implemented)
-| Pattern | Source | scx_cake Implementation |
-|---------|--------|------------------------|
-| **No Dynamic Allocation** | NASA JPL "Power of 10" | BPF enforces this |
-| **Fixed Loop Bounds** | NASA JPL "Power of 10" | `for (i = 0; i < 64; i++)` |
-| **Division-Free Math** | HPC Book / Trading Systems | `* 3277 >> 16` for `/20` |
-| **Cache Line Awareness** | LMAX Disruptor | Padding between atomic masks |
-| **Branchless Conditionals** | HPC Book | `-(s32)condition` masks |
-| **O(1) Data Structures** | Flat-CG Pattern | Tier array indexing |
+### A. The Linear Scan (Wait-Free `select_cpu`)
+**Old Way:** Atomic Bitmask (`idle_mask`) + CTZ instruction.
+*   *Issue:* Updates to the mask require atomic `LOCK XCHG` or `OR`, locking the memory bus.
+**New Way:** Wait-Free Linear Scan of the Scoreboard.
+*   We iterate through `scx_cake_scan_order[][]` (Topology Aware).
+*   We simply **Load** `cpu_status[target].is_idle`.
+*   **Why it's faster:**
+    1.  No Atomic Instructions (which cost ~20+ cycles and stall pipelines).
+    2.  Modern CPUs (Zen 4/5, Raptor Lake) have incredible hardware prefetchers that predict the linear memory access pattern.
+    3.  Data is often already hot in L3 cache.
 
-### Evaluated But Not Implemented
-| Pattern | Reason |
-|---------|--------|
-| **Batch Dispatch** | Risk of priority inversion for gaming |
-| **SMT-Aware Selection** | Unclear latency benefit |
-| **SIMD/Vectorization** | BPF doesn't support; sequential task processing |
-| **Ring Buffers** | Per-CPU arrays are already optimal for counters |
+### B. Zero-Cycle Enqueue
+**Problem:** When a task wakes up, calculating its `slice` and `tier` takes ~25-50 cycles of math.
+**Solution:** Pre-Calculation in `cake_stopping`.
+*   When a task *finishes* running, we know its runtime and behavior.
+*   We calculate its *next* tier and slice right then.
+*   We store these in `tctx->next_slice`.
+*   **Wakeup:** `cake_enqueue` simply acts as a dumb loader: `insert(p, cached_tier, cached_slice)`.
+*   *Cost during wakeup:* **~0 logic cycles**.
 
-### Key Academic References
-- **Algorithmica HPC Book**: Cache lines, branchless programming, integer division
-- **NASA JPL Power of 10**: Safety-critical C patterns
-- **LMAX Disruptor**: Lock-free SPSC patterns, mechanical sympathy
-- **Apollo Cyber RT**: Deterministic real-time scheduling
+### C. Jitter Entropy (Dispatch)
+**Problem:** Preventing starvation requires randomness (Probabilistic checking of low tiers). Generating random numbers in BPF is slow.
+**Solution:** "Jitter Entropy".
+*   We use the natural chaos of the system: `(pid ^ total_runtime_ns) & 0xF`.
+*   `total_runtime_ns` captures interrupt jitter, cache misses, and variable execution time.
+*   *Cost:* 3 ALU instructions. *Quality:* Sufficient for scheduling distribution.
+
+---
+
+## 4. Algorithmic Improvements
+
+### A. HFT Kalman Filter
+**Goal:** Estimate "Average Runtime" without storing a massive history window.
+**Implementation:** Bitwise Exponential Moving Average (IIR Filter) inspired by High Frequency Trading.
+*   Formula: `Avg = ((Avg << 6) - Avg + New) >> 6`.
+*   Avoids all floating point and integer division.
+*   Reacts quickly to behavior changes (Alpha = 1/64).
+
+### B. Sticky Victim Strategy (Tier 0)
+**Goal:** Prevent "Cache Trashing" when a light task (Mouse ISR) interrupts a heavy task (Game).
+**Logic:**
+*   When a Mouse Task preempts a Game Task on CPU 0...
+*   The Mouse Task remembers: "I victimized CPU 0".
+*   Next wakeup, it **sticks** to CPU 0 (if valid), running on top of the *same* victim.
+*   **Benefit:** The Game Task stays hot in L1/L2 cache on CPU 0. The Mouse Task executes quickly and leaves.
+*   **Avoids:** Migrating the interrupt to CPU 1, polluting CPU 1's cache, and forcing CPU 0's cache to go cold.
+
+### C. Branchless Tier Selection
+**Logic:** We avoid `if/else` chains in hot paths where possible.
+*   Example: Wait Budget Lookup.
+*   `budget = wait_budget[tier & 7];`
+*   The array is padded to size 8. The mask ensures safety. The load is O(1) and branch-free.
+
+---
+
+## 5. Architectural Decisions
+
+### A. Wait Tracking Fix (Jan 2026)
+**Discovery:** Preempted tasks were not resetting their wait timers, leading to false demotions for CPU-bound apps.
+**Fix:** Timestamp update moved to `cake_enqueue`.
+*   Captures both Wakeups (Select -> Enqueue) and Preemptions (Running -> Enqueue).
+*   Enables accurate Wait Budget logic for all workloads.
+
+### B. Why FIFO DSQs?
+We use `SCX_DSQ_LOCAL` (FIFO) instead of RB-Trees or Vtime.
+*   **Reason:** Throughput. FIFO is O(1). RB-Tree is O(log N).
+*   For a gaming scheduler, we serve the highest tier first. Sorting *within* a tier (Fairness) is unnecessary overhead.
+
+### C. Why Wait-Free?
+Wait-Free algorithms guarantee that no thread can block another.
+*   In `scx_cake`, CPU 0 can update its state without ever waiting for CPU 1.
+*   This removes the "Convoy Effect" where one slow core stalls the entire scheduler.
