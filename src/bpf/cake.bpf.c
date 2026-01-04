@@ -466,8 +466,9 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
      * The wait budget system in cake_running relies on last_wake_ts > 0.
      * OPTIMIZATION: scx_bpf_now() uses cached rq->clock instead of TSC read.
      */
+    /* Timestamp captured for Direct Dispatch and Stickiness */
     u64 now = scx_bpf_now();
-    tctx->last_wake_ts = now;
+    /* tctx->last_wake_ts = now; -- REMOVED: Redundant (Set in Enqueue) */
     
     /* 
      * OPTIMIZATION: Wait-Free Linear Scan (The Scoreboard)
@@ -493,13 +494,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         goto found_idle;
     }
 
-    /* 1. Remember prev_cpu preference (but don't commit yet) */
-    s32 prev_cpu_idle = -1;
-    if (prev_cpu >= 0 && prev_cpu < CAKE_MAX_CPUS) {
-        if (cpu_status[prev_cpu].is_idle) {
-            prev_cpu_idle = prev_cpu;
-        }
-    }
+    /* 1. Prev CPU handling is implicit in the scan order table */
 
     /* 1.5 Check Sticky Victim (The Bully Strategy) */
     /* Only Tier 0 tasks use this to contain interrupt damage */
@@ -565,10 +560,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
             }
         }
         
-        /* Fallback to prev_cpu if it was idle and scan found nothing */
-        if (best_idle < 0 && prev_cpu_idle >= 0) {
-            best_idle = prev_cpu_idle;
-        }
+        /* Scan order is exhaustive, no fallback needed */
     }
 
 found_idle:
