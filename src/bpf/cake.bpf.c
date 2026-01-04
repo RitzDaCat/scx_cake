@@ -116,16 +116,11 @@ static u64 cached_threshold_ns;
  * Lower tiers get LARGER slices (less context switching for bulk work)
  * PADDED TO 8 for Branchless Access (tier & 7).
  */
-static const u32 tier_multiplier[8] = {
-    717,   /* Tier 0: 0.7x (70%) -> 717/1024 */
-    819,   /* Tier 1:    0.8x (80%) -> 819/1024 */
-    922,   /* Tier 2:    0.9x (90%) -> 922/1024 */
-    1024,  /* Tier 3:      1.0x (100%) -> 1024/1024 */
-    1126,  /* Tier 4: 1.1x (110%) -> 1126/1024 */
-    1229,  /* Tier 5:       1.2x (120%) -> 1229/1024 */
-    1331,  /* Tier 6:  1.3x (130%) -> 1331/1024 */
-    1024,  /* PADDING: Entry 7 (Unused/Safe) */
-};
+/* 
+ * OPTIMIZATION: Removed tier_multiplier array.
+ * We now calculate the multiplier mathematically: 717 + (tier * 102).
+ * This saves 32 bytes of cache and replaces a Load with Map+Add.
+ */
 
 /* Sparse score thresholds for tier classification (0-100) */
 #define THRESHOLD_3      70   /* Score >= 70 → Tier 3 (only threshold actively used) */
@@ -393,7 +388,13 @@ static __always_inline void update_task_tier(struct task_struct *p, struct cake_
     u64 slice = (deficit_ns & mask_bonus) | (quantum_ns & ~mask_bonus);
     
     /* Apply tier multiplier and store */
-    tctx->next_slice = (slice * tier_multiplier[tier & 7]) >> 10;
+    /* 
+     * OPTIMIZATION: Linear Multiplier Calculation
+     * Value = Base(0.7x) + (Tier * 0.1x)
+     * 717 + (tier * 102)
+     */
+    u64 multiplier = 717 + ((u64)(tier & 7) * 102);
+    tctx->next_slice = (slice * multiplier) >> 10;
 }
 
 /*
@@ -757,13 +758,14 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
      * XOR with PID to scatter. Avoids helper overhead of prandom.
      */
     u32 local_shard = cpu & SCX_DSQ_SHARD_MASK;
+    u32 other_shard = local_shard ^ 1; /* Flip LSB to get neighbor */
     
     if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
         /* Give background a chance even if others have work */
         /* Check both shards of Tier 6 */
-        if (scx_bpf_dsq_nr_queued(DSQ_6 + local_shard) && scx_bpf_dsq_move_to_local(DSQ_6 + local_shard))
+        if (scx_bpf_dsq_nr_queued(DSQ_6 | local_shard) && scx_bpf_dsq_move_to_local(DSQ_6 | local_shard))
             return;
-        if (scx_bpf_dsq_nr_queued(DSQ_6 + (1 - local_shard)) && scx_bpf_dsq_move_to_local(DSQ_6 + (1 - local_shard)))
+        if (scx_bpf_dsq_nr_queued(DSQ_6 | other_shard) && scx_bpf_dsq_move_to_local(DSQ_6 | other_shard))
             return;
     }
     
@@ -778,16 +780,17 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
      * Calculate base mathematically (t * 2). 
      */
     s32 t;
+    /* Unroll hint for compiler (Clang) */
+    #pragma unroll
     for (t = 0; t < 7; t++) {
         u64 base = (u64)t * SCX_DSQ_SHARD_COUNT;
         
         /* Try local shard first for affinity */
-        if (scx_bpf_dsq_nr_queued(base + local_shard) && scx_bpf_dsq_move_to_local(base + local_shard))
+        if (scx_bpf_dsq_nr_queued(base | local_shard) && scx_bpf_dsq_move_to_local(base | local_shard))
             return;
         
         /* Try other shard */
-        u32 other_shard = 1 - local_shard;
-        if (scx_bpf_dsq_nr_queued(base + other_shard) && scx_bpf_dsq_move_to_local(base + other_shard))
+        if (scx_bpf_dsq_nr_queued(base | other_shard) && scx_bpf_dsq_move_to_local(base | other_shard))
             return;
     }
 }
