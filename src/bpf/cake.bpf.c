@@ -143,21 +143,21 @@ static const u32 tier_multiplier[8] = {
  * 
  * Formula: Starvation = 2x Wait Budget (consistent ratio)
  */
-#define WAIT_BUDGET_DSQ_0       100000    /* 100µs - ultra-tight for input */
-#define WAIT_BUDGET_DSQ_1       750000    /* 750µs */
+#define WAIT_BUDGET_DSQ_0       50000     /* 50µs - Aggressive demotion for imposters */
+#define WAIT_BUDGET_DSQ_1       1000000   /* 1ms */
 #define WAIT_BUDGET_DSQ_2       2000000   /* 2ms */
 #define WAIT_BUDGET_DSQ_3       4000000   /* 4ms */
-#define WAIT_BUDGET_DSQ_4       8000000   /* 8ms */
-#define WAIT_BUDGET_DSQ_5       20000000  /* 20ms */
+#define WAIT_BUDGET_DSQ_4       10000000  /* 10ms */
+#define WAIT_BUDGET_DSQ_5       100000000 /* 100ms */
 
 /* Array for O(1) wait budget lookup. PADDED TO 8 for Branchless Access (tier & 7). */
 static const u64 wait_budget[8] = {
-    WAIT_BUDGET_DSQ_0,       /* Tier 0: 100µs */
-    WAIT_BUDGET_DSQ_1,       /* Tier 1: 750µs */
+    WAIT_BUDGET_DSQ_0,       /* Tier 0: 50µs */
+    WAIT_BUDGET_DSQ_1,       /* Tier 1: 1ms */
     WAIT_BUDGET_DSQ_2,       /* Tier 2: 2ms */
     WAIT_BUDGET_DSQ_3,       /* Tier 3: 4ms */
-    WAIT_BUDGET_DSQ_4,       /* Tier 4: 8ms */
-    WAIT_BUDGET_DSQ_5,       /* Tier 5: 20ms */
+    WAIT_BUDGET_DSQ_4,       /* Tier 4: 10ms */
+    WAIT_BUDGET_DSQ_5,       /* Tier 5: 100ms */
     0,                       /* Tier 6: no limit */
     0,                       /* PADDING: Entry 7 (Safe) */
 };
@@ -168,23 +168,23 @@ static const u64 wait_budget[8] = {
  * 
  * Formula: Starvation = 2x Wait Budget (except Background which has generous limit)
  */
-#define STARVATION_DSQ_0        5000000    /* 5ms - Safety Net */
-#define STARVATION_DSQ_1        3000000    /* 3ms - 2x wait budget */
+#define STARVATION_DSQ_0        5000000    /* 5ms - Safety Net (unchanged) */
+#define STARVATION_DSQ_1        2000000    /* 2ms - 2x wait budget */
 #define STARVATION_DSQ_2        4000000    /* 4ms - 2x wait budget */
 #define STARVATION_DSQ_3        8000000    /* 8ms - 2x wait budget (Allow 16ms frame spikes) */
-#define STARVATION_DSQ_4        16000000   /* 16ms - 2x wait budget */
-#define STARVATION_DSQ_5        40000000   /* 40ms - 2x wait budget (Throughput) */
-#define STARVATION_DSQ_6        100000000  /* 100ms - Longest leash */
+#define STARVATION_DSQ_4        20000000   /* 20ms - 2x wait budget */
+#define STARVATION_DSQ_5        200000000  /* 200ms - 2x wait budget */
+#define STARVATION_DSQ_6        500000000  /* 500ms - Longest leash */
 
 /* Array for O(1) starvation threshold lookup. PADDED TO 8 for Branchless Access (tier & 7). */
 static const u64 starvation_threshold[8] = {
     STARVATION_DSQ_0,        /* Tier 0: Critical Latency - 5ms */
-    STARVATION_DSQ_1,        /* Tier 1: Realtime - 1.5ms */
+    STARVATION_DSQ_1,        /* Tier 1: Realtime - 2ms */
     STARVATION_DSQ_2,        /* Tier 2: Critical - 4ms */
     STARVATION_DSQ_3,        /* Tier 3: Gaming - 8ms */
-    STARVATION_DSQ_4,        /* Tier 4: Interactive - 16ms */
-    STARVATION_DSQ_5,        /* Tier 5: Batch - 40ms */
-    STARVATION_DSQ_6,        /* Tier 6: Background - 100ms */
+    STARVATION_DSQ_4,        /* Tier 4: Interactive - 20ms */
+    STARVATION_DSQ_5,        /* Tier 5: Batch - 200ms */
+    STARVATION_DSQ_6,        /* Tier 6: Background - 500ms */
     STARVATION_DSQ_6,        /* PADDING: Entry 7 (Safe) */
 };
 
@@ -289,12 +289,11 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p)
 static __always_inline void update_kalman_estimate(struct cake_task_ctx *tctx, u64 runtime_ns)
 {
     /* 
-     * OPTIMIZATION: Revert to Bitwise EMA (Fix Regression)
-     * The Kalman filter LUT + Multiply was too heavy (cache misses + ALU).
-     * We use a "Bitwise EMA" with Alpha=1/8.
-     * Formula: Avg = (Avg * 7 + New) / 8
-     * Bitwise: Avg = ((Avg << 3) - Avg + New) >> 3
-     * Cost: 0 Memory Accesses, 3 ALU ops.
+     * OPTIMIZATION: Bitwise EMA with Alpha=1/64
+     * Previously 1/8 (too volatile for 8KHz mice).
+     * Now 1/64 gives ~127 samples of history (~16ms at 8KHz).
+     * Formula: Avg = ((Avg << 6) - Avg + New) >> 6
+     * Cost: 0 Memory, 3 ALU ops (~1 cycle).
      */
     u32 meas_us = (u32)(runtime_ns >> 10);
     u32 avg_us = tctx->avg_runtime_us;
@@ -306,12 +305,12 @@ static __always_inline void update_kalman_estimate(struct cake_task_ctx *tctx, u
         tctx->avg_runtime_us = (u16)meas_us;
     } else {
         /*
-         * OPTIMIZATION: Standard IIR Filter
-         * Formula: Avg += (New - Avg) >> 3
-         * Instructions: SUB, SAR, ADD (3 ops). Saves 1 op over weighted sum.
+         * OPTIMIZATION: Standard IIR Filter (Alpha 1/64)
+         * Formula: Avg += (New - Avg) >> 6
+         * Instructions: SUB, SAR, ADD (3 ops).
          */
         s32 diff = (s32)meas_us - (s32)avg_us;
-        tctx->avg_runtime_us = (u16)((s32)avg_us + (diff >> 3));
+        tctx->avg_runtime_us = (u16)((s32)avg_us + (diff >> 6));
     }
 }
 
@@ -336,38 +335,55 @@ static __always_inline void update_task_tier(struct task_struct *p, struct cake_
     u32 score = GET_SPARSE_SCORE(tctx);
     u32 avg_us = tctx->avg_runtime_us;
     
-    /* OPTIMIZATION: Branchless Tier Selection (V2) */
+    /* 
+     * OPTIMIZATION: Branchless Tier Selection (V3)
+     * Calculate tier based on TWO factors:
+     * 1. Behavior Score (Sparseness/Yielding) -> "Score Tier"
+     * 2. Runtime Cost (Average Runtime) -> "Runtime Tier"
+     * 
+     * Final Tier = MAX(Score Tier, Runtime Tier)
+     * This enforcing limits: "You must be THIS sparse AND THIS fast".
+     */
     
-    /* 1. Calculate Tier from Score (Math instead of Table) */
-    /* Buckets: 0-29(6), 30-49(5), 50-69(4), 70-89(3), 90-100(2) */
-    u8 tier;
-    if (score < 30) {
-        tier = 6;
-    } else {
-        /* 
-         * Formula: 6 - ((Score - 10) / 20) works for 30-100
-         * BITWISE: Replace / 20 with * 3277 >> 16 (0.050003 approx)
-         * (x * 3277) >> 16 is exact for integers 0-100.
-         */
-        u32 val = (score - 10);
-        u32 res = (val * 3277) >> 16;
-        tier = 6 - (u8)res;
-    }
-    
-    /* 2. Apply Latency Gates for score=100 (Bitwise logic) */
-    /* If score==100 & avg>0... */
-    
-    bool is_100 = (score == 100);
-    bool has_history = (avg_us > 0);
-    bool check_gates = is_100 & has_history;
-    
-    /* adj = 2 if <50, 1 if <500, 0 otherwise */
-    s32 adj = (avg_us < 500) + (avg_us < 50);
-    s32 mask_gates = -(s32)check_gates; /* 0xFFFFFFFF if true */
-    
-    /* Apply adjustment if gates check passes */
-    /* tier 2 (Critical) -> tier 1 (Realtime) or tier 0 (CritLatency) */
-    tier -= (adj & mask_gates);
+    /* 
+     * 1. Calculate Score Tier 
+     * Ranges:
+     * 100:   Potential T0/T1
+     * 90-99: Tier 2
+     * 70-89: Tier 3
+     * 31-69: Tier 4
+     * 1-30:  Tier 5
+     * 0:     Tier 6
+     */
+    u8 score_tier;
+    if (score == 100) score_tier = 0;
+    else if (score >= 90) score_tier = 2;
+    else if (score >= 70) score_tier = 3;
+    else if (score >= 31) score_tier = 4;
+    else if (score >= 1)  score_tier = 5;
+    else score_tier = 6; /* Score 0 */
+
+    /* 
+     * 2. Calculate Runtime Tier (The Limits)
+     * Enforce strict runtime checks for each tier.
+     * T0: < 10us
+     * T1: < 100us
+     * T2: < 500us
+     * T3: < 1ms   (1000us)
+     * T4: < 2ms   (2000us)
+     * T5: < 50ms  (50000us)
+     */
+    u8 runtime_tier;
+    if (avg_us > 50000)      runtime_tier = 6;  /* > 50ms */
+    else if (avg_us > 2000)  runtime_tier = 5;  /* > 2ms */
+    else if (avg_us > 1000)  runtime_tier = 4;  /* > 1ms */
+    else if (avg_us > 500)   runtime_tier = 3;  /* > 500us */
+    else if (avg_us > 100)   runtime_tier = 2;  /* > 100us */
+    else if (avg_us > 5)     runtime_tier = 1;  /* > 5us */
+    else                     runtime_tier = 0;  /* <= 5us */
+
+    /* 3. Take the worst (MAX) of both worlds */
+    u8 tier = (score_tier > runtime_tier) ? score_tier : runtime_tier;
     
     SET_TIER(tctx, tier);
 
@@ -566,6 +582,9 @@ found_idle:
 
     /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
     if (is_idle) {
+        /* Update wake timestamp for direct dispatch (enqueue skipped) */
+        tctx->last_wake_ts = now;
+        
         /* Use SCX_ENQ_LAST to skip redundant enqueue call - saves 5-20µs */
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, SCX_ENQ_LAST);
         if (enable_stats) {
@@ -651,6 +670,14 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
         scx_bpf_dsq_insert(p, DSQ_4, quantum_ns, enq_flags);
         return;
     }
+
+    /* 
+     * FIX: Update wait timestamp here (Enqueue) instead of Select_Cpu.
+     * This ensures we capture the wait time for:
+     * 1. Wakeups (Select_Cpu -> Enqueue)
+     * 2. Preemptions (Running -> Enqueue) - WAS MISSING!
+     */
+    tctx->last_wake_ts = scx_bpf_now();
 
     /* Zero-Cycle Wakeup: Tier already calculated in cake_stopping */
     tier = GET_TIER(tctx);
@@ -812,14 +839,17 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
         u64 wait_time = now - tctx->last_wake_ts; /* Roughly * 1024 */
         
         /* 
-         * OPTIMIZATION: Bitwise Decay on Long Sleep
-         * If task slept for > 33ms (33,000,000ns), decay its history.
-         * Tuned for Tier 3: 33ms is ~2 frames. Resets "heavy" stats faster
-         * for bursty threads (e.g. loading screens -> gameplay).
-         * >> 1 is 50% decay (cheap 0-cycle logic vs Kalman reset).
+         * OPTIMIZATION: Bitwise Decay on TRUE Inactivity
+         * We check (now - last_run_at) to see how long since the task last ran.
+         * If > 1s, it means the task was Sleeping significantly (e.g. User AFK).
+         * We decay history to let it "prove itself" again quickly.
+         * (Using wait_time here would only check Queue Latency, which is wrong).
          */
-        if (wait_time > 33000000) {
-             tctx->avg_runtime_us >>= 1;
+        if (tctx->last_run_at > 0) {
+            u64 time_since_last_run = now - tctx->last_run_at;
+            if (time_since_last_run > 1000000000) {
+                tctx->avg_runtime_us >>= 1;
+            }
         }
 
         /* Tier read moved up for scoreboard */
