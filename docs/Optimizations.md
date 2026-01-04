@@ -157,3 +157,30 @@ dsq_id = (u64)tier * SCX_DSQ_SHARD_COUNT; // SHIFT (ALU access, 1 cycle)
 2.  **Running:** Coalesced `wait_data` writes into a single store instruction (avoiding double-write on demotion).
 3.  **Stopping:** `if (deficit > 0) update();` -> Skips subtraction and cache line dirtying for tasks that don't overrun their slice.
 **Impact:** Increases efficiency for "Good Citizen" tasks and reduces L1 Cache traffic.
+
+---
+
+## 7. Pass 5: Victim Selection Bypass (Select_CPU Refactor)
+
+**The Problem:**
+In a saturated system (e.g., Cyberpunk 2077 using 100% GPU + 90% CPU), the `cake_select_cpu` function rarely finds an idle core.
+**Old Logic:**
+1.  Scan for Idle CPU -> Fail.
+2.  Call `scx_bpf_select_cpu_dfl()` (Generic Kernel Fallback).
+    *   scans LLC domains again.
+    *   checks affinity masks again.
+    *   *Cost:* ~200-500 cycles.
+3.  **Then** check "Sticky Victim" logic (Tier 0).
+4.  If Victim found, override the result.
+**Result:** We paid the full cost of the generic helper, only to throw away its answer and pick our own victim.
+
+**New Logic (Pass 5):**
+1.  Scan for Idle CPU -> Fail.
+2.  **Check "Sticky Victim" immediately.**
+3.  If Victim found -> **Return Victim CPU.**
+4.  Only if NO Idle AND NO Victim -> Call `scx_bpf_select_cpu_dfl()`.
+
+**The Gain:**
+*   **Helper Elision:** We completely skip the expensive kernel fallback in the most critical scenario (Saturation).
+*   **Latency:** Shaves ~0.2µs off the wake-up path for Tier 0 (Framerate Critical) tasks.
+*   **Architecture:** Validates the "Fast Path First" design. If we know the answer (Victim), we shouldn't ask the kernel for a second opinion.

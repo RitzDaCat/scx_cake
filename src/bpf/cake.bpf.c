@@ -563,42 +563,7 @@ found_idle:
     if (best_idle >= 0) {
         cpu = best_idle;
         is_idle = true;
-    } else {
-        /* No idle CPU found - use default selection which handles SMT/LLC checks if needed */
-        cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-    }
-
-    /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
-    if (is_idle) {
-        /* Update wake timestamp for direct dispatch (enqueue skipped) */
-        tctx->last_wake_ts = now;
-        
-        /* Use SCX_ENQ_LAST to skip redundant enqueue call - saves 5-20µs */
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, SCX_ENQ_LAST);
-        if (enable_stats) {
-            struct cake_stats *s = get_local_stats();
-            if (s) s->nr_new_flow_dispatches++;
-        }
-        return cpu;  /* Critical: return early to avoid cake_enqueue */
-    }
-
-    /* 
-     * Preemption Injection (Latency path)
-     * If saturated, check if we can preempt a lower priority task.
-     */
-    /* 
-     * Preemption Injection (Latency path)
-     * If we didn't find an IDLE CPU, and we are Tier 0...
-     * check if our Single-Pass scan found a victim.
-     */
-    if (tier == CAKE_TIER_0 && victim_cpu >= 0) {
-        /*
-         * OPTIMIZATION: Hybrid Preemption (Safety + Speed)
-         *
-         * 1. Safety Net (Lazy): Always squash slice to 0.
-         *    Guarantees victim yields at next tick (max 1ms) if kick fails/skipped.
-         *    Cost: ~100 cycles (Free compared to 1ms wait).
-         */
+    } else if (tier == CAKE_TIER_0 && victim_cpu >= 0) {
         /*
          * OPTIMIZATION: Hybrid Preemption (Safety + Speed)
          *
@@ -635,14 +600,31 @@ found_idle:
         cpu = victim_cpu;
         
         /* Update sticky victim (only for Tier 0) */
-        if (tier == CAKE_TIER_0) {
-            tctx->last_victim_cpu = victim_cpu;
+        tctx->last_victim_cpu = victim_cpu;
+        
+        /* Bypass is_idle check and dfl */
+        return cpu;
+    } else {
+        /* No idle CPU found and no victim - use default selection */
+        cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    }
+
+    /* Direct dispatch if idle CPU found - bypasses DSQ entirely */
+    if (is_idle) {
+        /* Update wake timestamp for direct dispatch (enqueue skipped) */
+        tctx->last_wake_ts = now;
+        
+        /* Use SCX_ENQ_LAST to skip redundant enqueue call - saves 5-20µs */
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, quantum_ns, SCX_ENQ_LAST);
+        if (enable_stats) {
+            struct cake_stats *s = get_local_stats();
+            if (s) s->nr_new_flow_dispatches++;
         }
+        return cpu;  /* Critical: return early to avoid cake_enqueue */
     }
 
     return cpu;
 }
-
 /*
  * Enqueue task to the appropriate DSQ based on sparse detection
  */
@@ -683,9 +665,10 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     /* 
      * OPTIMIZATION: Stochastic Sharding for All Tiers
      * Distribute tasks across shards to reduce DSQ lock contention.
-     * Use (pid ^ cpu) for stateless distribution.
+     * Use pid for stateless distribution.
+     * REMOVED: bpf_get_smp_processor_id() helper call (saves ~15 cycles)
      */
-    u32 hash = (p->pid ^ bpf_get_smp_processor_id());
+    u32 hash = p->pid;
     u32 shard = hash & SCX_DSQ_SHARD_MASK;
     dsq_id += shard;
 
