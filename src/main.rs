@@ -6,6 +6,7 @@
 // configures it, and displays statistics.
 
 mod stats;
+mod topology;
 mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +67,7 @@ struct Args {
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     args: Args,
+    topology: topology::TopologyInfo,
 }
 
 impl<'a> Scheduler<'a> {
@@ -79,6 +81,9 @@ impl<'a> Scheduler<'a> {
             .open(open_object)
             .context("Failed to open BPF skeleton")?;
 
+        // Detect system topology (CCDs, P/E cores)
+        let topo = topology::detect()?;
+
         // Configure the scheduler via rodata (read-only data)
         if let Some(rodata) = &mut open_skel.maps.rodata_data {
             rodata.quantum_ns = args.quantum * 1000;
@@ -86,6 +91,14 @@ impl<'a> Scheduler<'a> {
             rodata.sparse_threshold = args.sparse_threshold;
             rodata.starvation_ns = args.starvation * 1000;
             rodata.enable_stats = args.verbose;  // Only collect stats when --verbose is used
+            
+            // Set topology flags (enables zero-cost dead code elimination)
+            rodata.has_dual_ccd = topo.has_dual_ccd;
+            rodata.has_hybrid_cores = topo.has_hybrid_cores;
+            rodata.ccd0_mask = topo.ccd0_mask;
+            rodata.ccd1_mask = topo.ccd1_mask;
+            rodata.p_core_mask = topo.p_core_mask;
+            rodata.cpus_per_ccd = topo.cpus_per_ccd;
         }
 
         // Load the BPF program
@@ -93,7 +106,7 @@ impl<'a> Scheduler<'a> {
             .load()
             .context("Failed to load BPF program")?;
 
-        Ok(Self { skel, args })
+        Ok(Self { skel, args, topology: topo })
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -112,7 +125,7 @@ impl<'a> Scheduler<'a> {
 
         if self.args.verbose {
             // Run TUI mode
-            tui::run_tui(&mut self.skel, shutdown.clone(), self.args.interval)?;
+            tui::run_tui(&mut self.skel, shutdown.clone(), self.args.interval, self.topology.clone())?;
         } else {
             // Silent mode - just wait for shutdown
             while !shutdown.load(Ordering::Relaxed) {

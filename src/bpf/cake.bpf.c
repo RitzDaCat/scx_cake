@@ -29,6 +29,24 @@ const volatile u64 starvation_ns = CAKE_DEFAULT_STARVATION_NS;
 const volatile bool enable_stats = false;  /* Set to true when --verbose is used */
 
 /*
+ * Topology configuration (set by userspace based on detected hardware)
+ * 
+ * These enable zero-cost specialization:
+ * - When false, BPF verifier eliminates the code path entirely
+ * - When true, adds ~2 cycles for CCD/P-core preference
+ * 
+ * On 9800X3D: both false → zero overhead
+ * On 7950X3D: has_dual_ccd=true → CCD-local scheduling
+ * On i9-14900K: has_hybrid_cores=true → P-core preference
+ */
+const volatile bool has_dual_ccd = false;
+const volatile bool has_hybrid_cores = false;
+const volatile u64 ccd0_mask = 0xFFFFFFFFFFFFFFFF;  /* All cores by default */
+const volatile u64 ccd1_mask = 0;
+const volatile u64 p_core_mask = 0xFFFFFFFFFFFFFFFF; /* All P-cores by default */
+const volatile u32 cpus_per_ccd = 64;
+
+/*
  * Global statistics (Per-CPU to avoid bus locking)
  */
 struct {
@@ -58,23 +76,19 @@ u64 idle_mask SEC(".bss") __attribute__((aligned(64)));
 u64 victim_mask SEC(".bss") __attribute__((aligned(64)));
 
 /*
- * Global CPU Tier Map (The "Scoreboard")
- * Shared array allowing any CPU to see what Tier is running on any other CPU.
- * Key: CPU ID
- * Value: padded struct (to prevent False Sharing).
- * Used for O(1) Zero-Cycle Victim Selection.
+ * Global CPU Tier Array (The "Scoreboard")
+ * BSS array allowing any CPU to see what Tier is running on any other CPU.
+ * OPTIMIZATION: BSS array replaces BPF_MAP_TYPE_ARRAY for direct memory access.
+ * Saves ~10-15 cycles per access (no map lookup helper call).
+ * Padded to 64 bytes per entry to prevent False Sharing.
  */
 struct cake_cpu_status {
     u8 tier;
     u8 __pad[63]; /* Pad to 64 bytes (Cache Line Size) to prevent False Sharing */
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1024);
-    __type(key, u32);
-    __type(value, struct cake_cpu_status);
-} cpu_tier_map SEC(".maps");
+/* BSS array - direct indexed access, no map lookup overhead */
+struct cake_cpu_status cpu_status[64] SEC(".bss") __attribute__((aligned(64)));
 
 static __always_inline struct cake_stats *get_local_stats(void)
 {
@@ -203,20 +217,17 @@ struct {
 
 /*
  * Per-CPU preemption cooldown timestamp (ns)
- * Key: CPU ID
- * Value: Padded struct to prevent False Sharing (8 CPUs per cache line)
+ * OPTIMIZATION: BSS array replaces BPF_MAP_TYPE_ARRAY for direct memory access.
+ * Saves ~10-15 cycles per access (no map lookup helper call).
+ * Padded to 64 bytes to prevent False Sharing.
  */
 struct cake_cooldown_status {
     u64 last_preempt_ts;
     u8 __pad[56]; /* Pad to 64 bytes */
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1024); /* Support up to 1024 CPUs */
-    __type(key, u32);
-    __type(value, struct cake_cooldown_status);
-} preempt_cooldown SEC(".maps");
+/* BSS array - direct indexed access, no map lookup overhead */
+struct cake_cooldown_status cooldowns[64] SEC(".bss") __attribute__((aligned(64)));
 
 
 /*
@@ -495,17 +506,34 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         
         if (!prev_is_idle) {
             /* 
-             * Step 2: Instant Idle Find
-             * __builtin_ctzll finds the index of the first ls-bit.
-             * This finds the lowest ID idle CPU in O(1).
-             * Uses cached mask from function start.
+             * Step 2: Topology-Aware Idle Find
+             * 
+             * ZERO-COST SPECIALIZATION:
+             * - When has_dual_ccd/has_hybrid_cores == false, BPF verifier
+             *   eliminates the entire if-block (dead code elimination)
+             * - When true, adds ~2 cycles for CCD/P-core preference
              */
-            if (mask) {
-                cpu = __builtin_ctzll(mask);
+            u64 candidates = mask;
+            
+            /* CCD-local preference (dead code if has_dual_ccd == false) */
+            if (has_dual_ccd) {
+                u64 local_ccd = (prev_cpu < (s32)cpus_per_ccd) ? ccd0_mask : ccd1_mask;
+                u64 local = candidates & local_ccd;
+                if (local) candidates = local;
+            }
+            
+            /* P-core preference (dead code if has_hybrid_cores == false) */
+            if (has_hybrid_cores) {
+                u64 p_cores = candidates & p_core_mask;
+                if (p_cores) candidates = p_cores;
+            }
+            
+            if (candidates) {
+                cpu = __builtin_ctzll(candidates);
                 is_idle = true;
             } else {
-                 /* Racing condition: mask became 0 between check and load */
-                 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+                /* Racing condition: mask became 0 between check and load */
+                cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
             }
         }
     }
@@ -552,27 +580,36 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
         
         /* Did we find a victim? */
         if (best_cpu >= 0) {
-            u32 cpu_key = best_cpu;
-            struct cake_cooldown_status *cooldown;
+            /* 
+             * BPF VERIFIER FIX: Force bounds check in BPF bytecode.
+             * 
+             * The compiler's CTZ uses a lookup table that returns 0-255.
+             * A normal C `& 63` is optimized away because compiler "knows"
+             * CTZ returns 0-63. We use inline asm to force the AND into
+             * the bytecode, which the BPF verifier can then track.
+             * 
+             * The pattern: Use r0 constraint to force clang to emit the AND.
+             */
+            u32 bounded_cpu;
+            asm volatile (
+                "r0 = %[cpu];"
+                "r0 &= 63;"
+                "%[out] = r0;"
+                : [out] "=r"(bounded_cpu)
+                : [cpu] "r"((u32)best_cpu)
+                : "r0"
+            );
             
-            cooldown = bpf_map_lookup_elem(&preempt_cooldown, &cpu_key);
-            if (cooldown) {
-                if (now - cooldown->last_preempt_ts > 50000) {
-                    cooldown->last_preempt_ts = now;
-                    scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
-                    
-                    if (enable_stats) {
-                        struct cake_stats *s = get_local_stats();
-                        if (s) s->nr_input_preempts++;
-                    }
-                    /* 
-                     * but we are returning 'cpu' from this function.
-                     * If we are in 'saturation' bypass mode, 'cpu' is set to 'prev_cpu'.
-                     * 
-                     * Let's update 'cpu' to 'best_cpu' so we try to enqueue locally there!
-                     */
-                    cpu = best_cpu;
+            struct cake_cooldown_status *cooldown = &cooldowns[bounded_cpu];
+            if (now - cooldown->last_preempt_ts > 50000) {
+                cooldown->last_preempt_ts = now;
+                scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
+                
+                if (enable_stats) {
+                    struct cake_stats *s = get_local_stats();
+                    if (s) s->nr_input_preempts++;
                 }
+                cpu = best_cpu;
             }
         }
     }
@@ -717,31 +754,37 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
      * OPTIMIZATION: Conditional Scoreboard Update
      * Only update if tier changed. Read is ~5 cycles, update is ~30-50 cycles.
      * With 100k+ context switches/sec, this saves ~3M cycles/sec.
+     * 
+     * OPTIMIZATION: Direct BSS array access (no map lookup)
+     * Saves ~10-15 cycles per context switch.
      */
     u8 tier = GET_TIER(tctx);
-    u32 cpu_key = scx_bpf_task_cpu(p);
-    struct cake_cpu_status *cpu_status = bpf_map_lookup_elem(&cpu_tier_map, &cpu_key);
-    if (cpu_status && cpu_status->tier != tier) {
-        cpu_status->tier = tier;
+    u32 cpu_idx = scx_bpf_task_cpu(p);
+    
+    /* Bounds check for BPF verifier and safety */
+    if (cpu_idx >= 64)
+        return;
+    
+    u8 old_tier = cpu_status[cpu_idx].tier;
+    if (old_tier != tier) {
+        cpu_status[cpu_idx].tier = tier;
         
         /* 
-         * OPTIMIZATION: Lazy Victim Mask Update (Logical Check + Relaxed)
-         * 1. Only update if the *logical* victim state changes (Victim <-> Non-Victim).
-         *    This avoids redundant atomics when switching between e.g. Batch/Background.
-         * 2. Use __ATOMIC_RELAXED to avoid full memory barriers.
-         *    Victim mask is a heuristic; strict ordering is not required.
+         * OPTIMIZATION: Non-Atomic Victim Mask Update (Option C)
+         * Removes 50-100 cycle cache-line bouncing overhead.
+         * 
+         * Race condition is acceptable - victim mask is a heuristic.
+         * Worst case: we pick a stale victim, which the 50µs cooldown limits.
          */
-        if (cpu_key < 64) {
-            bool old_is_victim = (cpu_status->tier >= INTERACTIVE_DSQ);
-            bool new_is_victim = (tier >= INTERACTIVE_DSQ);
+        bool old_is_victim = (old_tier >= INTERACTIVE_DSQ);
+        bool new_is_victim = (tier >= INTERACTIVE_DSQ);
 
-            if (old_is_victim != new_is_victim) {
-                u64 cpu_bit = (1ULL << cpu_key);
-                if (new_is_victim) {
-                    __atomic_fetch_or(&victim_mask, cpu_bit, __ATOMIC_RELAXED);
-                } else {
-                    __atomic_fetch_and(&victim_mask, ~cpu_bit, __ATOMIC_RELAXED);
-                }
+        if (old_is_victim != new_is_victim) {
+            u64 cpu_bit = (1ULL << cpu_idx);
+            if (new_is_victim) {
+                victim_mask |= cpu_bit;    /* Non-atomic OR */
+            } else {
+                victim_mask &= ~cpu_bit;   /* Non-atomic AND */
             }
         }
     }

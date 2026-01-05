@@ -105,6 +105,18 @@ struct cake_stats {
     u64 nr_input_preempts;                 /* Preemptions injected for input/latency */
 };
 
+/*
+ * Topology flags - set by userspace at load time
+ * 
+ * These enable zero-cost specialization. When a flag is false,
+ * the BPF verifier eliminates the corresponding code path entirely.
+ * 
+ * Example: On 9800X3D (single CCD, no hybrid):
+ *   has_dual_ccd = false      → CCD selection code eliminated
+ *   has_hybrid_cores = false  → P-core preference code eliminated
+ *   Result: Zero overhead compared to no topology support
+ */
+
 /* Default values */
 #define CAKE_DEFAULT_QUANTUM_NS         (4 * 1000 * 1000)   /* 4ms */
 #define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)   /* 8ms */

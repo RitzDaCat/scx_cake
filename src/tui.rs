@@ -24,6 +24,7 @@ use ratatui::{
 use crate::bpf_skel::types::cake_stats;
 use crate::bpf_skel::BpfSkel;
 use crate::stats::TIER_NAMES;
+use crate::topology::TopologyInfo;
 use libbpf_rs::{MapFlags, MapCore};
 
 fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
@@ -89,13 +90,15 @@ fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
 pub struct TuiApp {
     start_time: Instant,
     status_message: Option<(String, Instant)>,
+    topology: TopologyInfo,
 }
 
 impl TuiApp {
-    pub fn new() -> Self {
+    pub fn new(topology: TopologyInfo) -> Self {
         Self {
             start_time: Instant::now(),
             status_message: None,
+            topology,
         }
     }
 
@@ -203,9 +206,18 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     } else {
         0.0
     };
+    
+    // Build topology info string
+    let topo_info = format!(
+        "CPUs: {} {}{}",
+        app.topology.nr_cpus,
+        if app.topology.has_dual_ccd { "[Dual-CCD]" } else { "" },
+        if app.topology.has_hybrid_cores { "[Hybrid]" } else { "" },
+    );
+    
     let header_text = format!(
-        " Dispatches: {} total ({:.1}% new-flow)  │  Uptime: {}",
-        total_dispatches, new_pct, app.format_uptime()
+        " {}  │  Dispatches: {} ({:.1}% new)  │  Uptime: {}",
+        topo_info, total_dispatches, new_pct, app.format_uptime()
     );
     let header = Paragraph::new(header_text)
         .block(Block::default()
@@ -312,9 +324,10 @@ pub fn run_tui(
     skel: &mut BpfSkel,
     shutdown: Arc<AtomicBool>,
     interval_secs: u64,
+    topology: TopologyInfo,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut app = TuiApp::new();
+    let mut app = TuiApp::new(topology);
     let tick_rate = Duration::from_secs(interval_secs);
     let mut last_tick = Instant::now();
     
