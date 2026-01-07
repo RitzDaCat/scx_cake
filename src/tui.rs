@@ -24,6 +24,7 @@ use ratatui::{
 use crate::bpf_skel::types::cake_stats;
 use crate::bpf_skel::BpfSkel;
 use crate::stats::TIER_NAMES;
+use crate::topology::TopologyInfo;
 use libbpf_rs::{MapFlags, MapCore};
 
 fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
@@ -61,24 +62,11 @@ fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
         
         for i in 0..crate::stats::TIER_NAMES.len() {
             total.nr_tier_dispatches[i] += s.nr_tier_dispatches[i];
-            total.nr_wait_demotions_tier[i] += s.nr_wait_demotions_tier[i];
             total.nr_starvation_preempts_tier[i] += s.nr_starvation_preempts_tier[i];
-            total.total_wait_ns_tier[i] += s.total_wait_ns_tier[i];
-            total.nr_waits_tier[i] += s.nr_waits_tier[i];
-            // Max is max, not sum
-            if s.max_wait_ns_tier[i] > total.max_wait_ns_tier[i] {
-                total.max_wait_ns_tier[i] = s.max_wait_ns_tier[i];
-            }
         }
         
         total.nr_sparse_promotions += s.nr_sparse_promotions;
         total.nr_sparse_demotions += s.nr_sparse_demotions;
-        total.nr_wait_demotions += s.nr_wait_demotions;
-        total.total_wait_ns += s.total_wait_ns;
-        total.nr_waits += s.nr_waits;
-        if s.max_wait_ns > total.max_wait_ns {
-            total.max_wait_ns = s.max_wait_ns;
-        }
         total.nr_input_preempts += s.nr_input_preempts;
     }
 
@@ -89,13 +77,15 @@ fn aggregate_stats(map: &libbpf_rs::Map) -> Result<cake_stats> {
 pub struct TuiApp {
     start_time: Instant,
     status_message: Option<(String, Instant)>,
+    topology: TopologyInfo,
 }
 
 impl TuiApp {
-    pub fn new() -> Self {
+    pub fn new(topology: TopologyInfo) -> Self {
         Self {
             start_time: Instant::now(),
             status_message: None,
+            topology,
         }
     }
 
@@ -151,32 +141,23 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
     } else {
         0.0
     };
-    let avg_wait_us = if stats.nr_waits > 0 {
-        (stats.total_wait_ns / stats.nr_waits) / 1000
-    } else {
-        0
-    };
 
     let mut output = String::new();
     output.push_str(&format!("=== scx_cake Statistics (Uptime: {}) ===\n\n", uptime));
     output.push_str(&format!("Dispatches: {} total ({:.1}% new-flow)\n\n", total_dispatches, new_pct));
     
-    output.push_str("Tier           Dispatches    Max Wait    WaitDemote  StarvPreempt\n");
-    output.push_str("─────────────────────────────────────────────────────────────────\n");
+    output.push_str("Tier           Dispatches    StarvPreempt\n");
+    output.push_str("───────────────────────────────────────────\n");
     for (i, name) in TIER_NAMES.iter().enumerate() {
-        let max_wait_us = stats.max_wait_ns_tier[i] / 1000;
         output.push_str(&format!(
-            "{:12}   {:>10}    {:>6} µs    {:>10}  {:>12}\n",
-            name, stats.nr_tier_dispatches[i], max_wait_us,
-            stats.nr_wait_demotions_tier[i], stats.nr_starvation_preempts_tier[i]
+            "{:12}   {:>10}    {:>12}\n",
+            name, stats.nr_tier_dispatches[i], stats.nr_starvation_preempts_tier[i]
         ));
     }
     
-    output.push_str(&format!("\nSparse flow: +{} promotions, -{} demotions, {} wait-demotes\n",
-        stats.nr_sparse_promotions, stats.nr_sparse_demotions, stats.nr_wait_demotions));
+    output.push_str(&format!("\nSparse flow: +{} promotions, -{} demotions\n",
+        stats.nr_sparse_promotions, stats.nr_sparse_demotions));
     output.push_str(&format!("Input: {} preempts fired\n", stats.nr_input_preempts));
-    output.push_str(&format!("Wait time: avg {} µs, max {} µs\n",
-        avg_wait_us, stats.max_wait_ns / 1000));
     
     output
 }
@@ -203,9 +184,18 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     } else {
         0.0
     };
+    
+    // Build topology info string
+    let topo_info = format!(
+        "CPUs: {} {}{}",
+        app.topology.nr_cpus,
+        if app.topology.has_dual_ccd { "[Dual-CCD]" } else { "" },
+        if app.topology.has_hybrid_cores { "[Hybrid]" } else { "" },
+    );
+    
     let header_text = format!(
-        " Dispatches: {} total ({:.1}% new-flow)  │  Uptime: {}",
-        total_dispatches, new_pct, app.format_uptime()
+        " {}  │  Dispatches: {} ({:.1}% new)  │  Uptime: {}",
+        topo_info, total_dispatches, new_pct, app.format_uptime()
     );
     let header = Paragraph::new(header_text)
         .block(Block::default()
@@ -216,7 +206,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     frame.render_widget(header, layout[0]);
 
     // --- Stats Table ---
-    let header_cells = ["Tier", "Dispatches", "Max Wait", "WaitDemote", "StarvPreempt"]
+    let header_cells = ["Tier", "Dispatches", "StarvPreempt"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header_row = Row::new(header_cells).height(1);
@@ -225,12 +215,9 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let max_wait_us = stats.max_wait_ns_tier[i] / 1000;
             let cells = vec![
                 Cell::from(*name).style(tier_style(i)),
                 Cell::from(format!("{}", stats.nr_tier_dispatches[i])),
-                Cell::from(format!("{} µs", max_wait_us)),
-                Cell::from(format!("{}", stats.nr_wait_demotions_tier[i])),
                 Cell::from(format!("{}", stats.nr_starvation_preempts_tier[i])),
             ];
             Row::new(cells).height(1)
@@ -240,8 +227,6 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),
-            Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(14),
@@ -255,18 +240,11 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     frame.render_widget(table, layout[1]);
 
     // --- Summary ---
-    let avg_wait_us = if stats.nr_waits > 0 {
-        (stats.total_wait_ns / stats.nr_waits) / 1000
-    } else {
-        0
-    };
     let summary_text = format!(
-        " Sparse flow: +{} promotions, -{} demotions, {} wait-demotes\n \
-         Input: {} preempts fired\n \
-         Wait time: avg {} µs, max {} µs (overall)",
-        stats.nr_sparse_promotions, stats.nr_sparse_demotions, stats.nr_wait_demotions,
-        stats.nr_input_preempts,
-        avg_wait_us, stats.max_wait_ns / 1000
+        " Sparse flow: +{} promotions, -{} demotions\n \
+         Input: {} preempts fired",
+        stats.nr_sparse_promotions, stats.nr_sparse_demotions,
+        stats.nr_input_preempts
     );
     let summary = Paragraph::new(summary_text)
         .block(Block::default()
@@ -312,9 +290,10 @@ pub fn run_tui(
     skel: &mut BpfSkel,
     shutdown: Arc<AtomicBool>,
     interval_secs: u64,
+    topology: TopologyInfo,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut app = TuiApp::new();
+    let mut app = TuiApp::new(topology);
     let tick_rate = Duration::from_secs(interval_secs);
     let mut last_tick = Instant::now();
     
