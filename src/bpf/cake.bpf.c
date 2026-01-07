@@ -64,7 +64,20 @@ struct {
  * 
  * Write side uses atomic ops - acceptable cost for fast read.
  */
-u64 idle_mask SEC(".bss") __attribute__((aligned(64)));
+/*
+ * Global Idle Mask (Dual-View Union)
+ * 
+ * "Wait-Free" Implementation:
+ * - WRITE: Write to 'as_bytes' (u8) is a single standard store. No ATOMIC LOCK. 
+ *          Store buffer handles coherency (Wait-Free).
+ * - READ:  Read 'as_chunks' (u64) to scan 8 CPUs at once.
+ */
+struct {
+    union {
+        u8  as_bytes[64];   /* WRITE VIEW: Access individually (No False Sharing logic) */
+        u64 as_chunks[8];   /* READ VIEW:  Access in 8 chunks (Fast Scan) */
+    };
+} idle_map SEC(".bss") __attribute__((aligned(64)));
 
 /*
  * Global Victim Mask (Bitmask for CTZ scanning)
@@ -75,12 +88,20 @@ u64 idle_mask SEC(".bss") __attribute__((aligned(64)));
 u64 victim_mask SEC(".bss") __attribute__((aligned(64)));
 
 /*
- * DSQ Non-Empty Byte-Mask (Lock-Free DSQ Tracking)
+ * DSQ Non-Empty Mask (Lock-Free DSQ Tracking)
  * 
- * BYTEMASK because we check SPECIFIC DSQs by index, not scan.
- * dsq_has_tasks[GAMING_DSQ] is a direct byte load - perfect for bytemask.
+ * CACHE ISOLATION OPTIMIZATION:
+ * We align to 64 bytes to prevent False Sharing with 'victim_mask'.
+ * 'victim_mask' is written frequently in the hot path. If they share a 
+ * cache line, the Dispatcher suffers constant L1 cache misses.
  */
-u8 dsq_has_tasks[8] SEC(".bss") __attribute__((aligned(8)));
+struct {
+    u32 flags[8];
+    u32 __pad[8]; /* Explicit padding to fill the 64-byte line */
+} dsq_state SEC(".bss") __attribute__((aligned(64)));
+
+/* Convenience macro so you don't have to rewrite code */
+#define dsq_has_tasks dsq_state.flags
 
 /*
  * Global CPU Tier Array (The "Scoreboard")
@@ -101,6 +122,32 @@ static __always_inline struct cake_stats *get_local_stats(void)
 {
     u32 key = 0;
     return bpf_map_lookup_elem(&stats_map, &key);
+}
+
+/*
+ * Helper: Find first idle CPU using Dual-View Scan
+ * Replaces __builtin_ctzll(idle_mask)
+ */
+static __always_inline s32 find_first_idle_cpu(s32 prev_cpu)
+{
+    /* 1. Check prev_cpu direct (Fastest - 1 byte load) */
+    if (prev_cpu >= 0 && prev_cpu < 64 && idle_map.as_bytes[prev_cpu]) 
+        return prev_cpu;
+
+    /* 2. Scan 8 chunks of 8 CPUs each (Unrolled) */
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        u64 chunk = idle_map.as_chunks[i];
+        if (chunk) {
+            /* Found a chunk with idle CPUs! Find the specific bit. */
+            /* Note: Bytes are 0x01 or 0x00. */
+            /* If byte 0 is set (0x01), ctz is 0. 0 >> 3 = 0. */
+            /* If byte 1 is set (0x0100), ctz is 8. 8 >> 3 = 1. */
+            int bit = __builtin_ctzll(chunk);
+            return (i * 8) + (bit >> 3); 
+        }
+    }
+    return -1;
 }
 
 /* User exit info for graceful scheduler exit */
@@ -291,34 +338,39 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
      * OPTIMIZATION: Bitmask Idle Search (O(1) via CTZ)
      * We use a global 64-bit mask where set bits = idle CPUs.
      */
-    u64 mask = idle_mask;
+    /* 
+     * OPTIMIZATION: Wait-Free Idle Search (Dual-View)
+     */
     
     /* Move tier read up for the check */
     u8 tier = GET_TIER(tctx);
-    
-    if (mask == 0 && tier > REALTIME_DSQ) {
-        /* No idle CPUs exist. Skip expensive search. */
-        return prev_cpu;
-    }
 
-    if (mask == 0) {
-        cpu = prev_cpu;
-        is_idle = false;
+    /* Quick check: Scan chunks to see if ANYONE is idle */
+    /* Checks first 64 CPUs. If we have >64, we might need loops, but logic assumes 64 max */
+    /* Unrolled check of chunks for early exit? No, find_first_idle_cpu handles it. */
+
+    is_idle = false;
+    cpu = prev_cpu; /* Default */
+
+    /* Only search if we are not lowest priority (optimization) */
+    if (tier <= REALTIME_DSQ) {
+         s32 idle_cpu = find_first_idle_cpu(prev_cpu);
+         if (idle_cpu >= 0) {
+             cpu = idle_cpu;
+             is_idle = true;
+         }
     } else {
-        /* 
-         * OPTIMIZATION: Bitmask Idle Find (O(1))
-         * 1. Check prev_cpu first (cache locality)
-         * 2. Use CTZ to find any idle CPU
-         */
-        
-        /* Step 1: Check Sticky/Prev CPU */
-        if (prev_cpu >= 0 && prev_cpu < 64 && (mask & (1ULL << prev_cpu))) {
-            is_idle = true;
-            cpu = prev_cpu;
+        /* For lower tiers, only check prev_cpu (stickiness) */
+        if (prev_cpu >= 0 && prev_cpu < 64 && idle_map.as_bytes[prev_cpu]) {
+             cpu = prev_cpu;
+             is_idle = true;
         } else {
-            /* Step 2: Find any idle CPU via CTZ */
-            cpu = __builtin_ctzll(mask);
-            is_idle = true;
+             /* Try to find ANY idle CPU if we couldn't stick */
+             s32 idle_cpu = find_first_idle_cpu(-1);
+             if (idle_cpu >= 0) {
+                 cpu = idle_cpu;
+                 is_idle = true;
+             }
         }
     }
 
@@ -471,37 +523,44 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
     /*
      * Starvation protection: probabilistically let lower tiers run
      */
+    /*
+     * Processing Loop with Double-Checked Clearing
+     * We iterate manually to apply the double-check logic for each DSQ.
+     */
+    
+    /*
+     * ROCKET SHIP DISPATCH LOGIC (With Cache Hit Optimization)
+     * 
+     * 1. Check Flag (L1 Cache Hit - 1 cycle): 
+     *    Thanks to alignment, this is instant. It filters out unused queues.
+     * 2. Check Count (Helper Call - ~10 cycles):
+     *    Filters out empty queues without locking/atomic clearing.
+     * 3. Move Tasks (Heavy):
+     *    Only executes if work is guaranteed.
+     */
+    #define TRY_DISPATCH(ds_id) \
+        if (dsq_has_tasks[ds_id]) { \
+            if (scx_bpf_dsq_nr_queued(ds_id) > 0) { \
+                if (scx_bpf_dsq_move_to_local(ds_id)) return; \
+            } \
+        }
+
+    /* Starvation Protection */
     if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
-        if (dsq_has_tasks[BACKGROUND_DSQ] && scx_bpf_dsq_move_to_local(BACKGROUND_DSQ)) {
-            return;
-        }
-        if (dsq_has_tasks[INTERACTIVE_DSQ] && scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ)) {
-            return;
-        }
+        TRY_DISPATCH(BACKGROUND_DSQ);
+        TRY_DISPATCH(INTERACTIVE_DSQ);
     }
     
-    /* Priority order with O(1) byte-mask pre-check */
-    if (dsq_has_tasks[CRITICAL_LATENCY_DSQ] && scx_bpf_dsq_move_to_local(CRITICAL_LATENCY_DSQ)) {
-        return;
-    }
-    if (dsq_has_tasks[REALTIME_DSQ] && scx_bpf_dsq_move_to_local(REALTIME_DSQ)) {
-        return;
-    }
-    if (dsq_has_tasks[CRITICAL_DSQ] && scx_bpf_dsq_move_to_local(CRITICAL_DSQ)) {
-        return;
-    }
-    if (dsq_has_tasks[GAMING_DSQ] && scx_bpf_dsq_move_to_local(GAMING_DSQ)) {
-        return;
-    }
-    if (dsq_has_tasks[INTERACTIVE_DSQ] && scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ)) {
-        return;
-    }
-    if (dsq_has_tasks[BATCH_DSQ] && scx_bpf_dsq_move_to_local(BATCH_DSQ)) {
-        return;
-    }
-    if (dsq_has_tasks[BACKGROUND_DSQ] && scx_bpf_dsq_move_to_local(BACKGROUND_DSQ)) {
-        /* No clear */
-    }
+    /* Priority Dispatch */
+    TRY_DISPATCH(CRITICAL_LATENCY_DSQ);
+    TRY_DISPATCH(REALTIME_DSQ);
+    TRY_DISPATCH(CRITICAL_DSQ);
+    TRY_DISPATCH(GAMING_DSQ);
+    TRY_DISPATCH(INTERACTIVE_DSQ);
+    TRY_DISPATCH(BATCH_DSQ);
+    TRY_DISPATCH(BACKGROUND_DSQ);
+    
+    #undef TRY_DISPATCH
 }
 
 /*
@@ -526,12 +585,15 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     /* Unconditional scoreboard write (1 store vs read+cmp+branch+store) */
     cpu_status[cpu_idx].tier = tier;
     
-    /* Unconditional victim_mask update (1 bitwise op vs read+cmp+branch+bitwise) */
+    /* Unconditional victim_mask update (Racy Write / Heuristic) */
+    u64 mask = victim_mask;
     u64 cpu_bit = (1ULL << cpu_idx);
     if (tier >= INTERACTIVE_DSQ) {
-        victim_mask |= cpu_bit;
+        /* RACY SET: If multiple CPUs write, we might lose a bit. Acceptable. */
+        victim_mask = mask | cpu_bit;
     } else {
-        victim_mask &= ~cpu_bit;
+        /* RACY CLEAR */
+        victim_mask = mask & ~cpu_bit;
     }
 
     tctx->last_run_at = (u32)scx_bpf_now();
@@ -594,25 +656,14 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 void BPF_STRUCT_OPS(cake_update_idle, s32 cpu, bool idle)
 {
     /* Cap CPU ID to 63 for 64-bit mask safety */
+    /* Cap CPU ID to 63 for 64-bit mask safety */
     if (cpu >= 0 && cpu < 64) {
-         u64 bit = (1ULL << cpu);
          /* 
-          * OPTIMIZATION: Local Buffering (Test-and-Test-and-Set)
-          * We read the global mask into a local variable first.
-          * Only if the bit is different do we pay the cost of the atomic bus lock.
-          * This matches the "Local Buffering" pattern by avoiding "Naive" global updates.
+          * WAIT-FREE WRITE:
+          * Just a standard store. The Store Buffer handles coherency.
+          * Cost: ~1 cycle. No bus locking.
           */
-         u64 mask = idle_mask; 
-
-         if (idle) {
-             /* Mark as Idle (Set Bit) - Only if not already set */
-             if (!(mask & bit))
-                 __atomic_fetch_or(&idle_mask, bit, __ATOMIC_RELAXED);
-         } else {
-             /* Mark as Busy (Clear Bit) - Only if currently set */
-             if (mask & bit)
-                 __atomic_fetch_and(&idle_mask, ~bit, __ATOMIC_RELAXED);
-         }
+         idle_map.as_bytes[cpu] = idle ? 1 : 0;
     }
 }
 
@@ -688,19 +739,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
     }
 
     /* Initialize Idle Mask (Correctness Sync) */
+    /* Initialize Idle Mask (Wait-Free init) */
     u32 nr_cpus = scx_bpf_nr_cpu_ids();
-    u64 init_mask = 0;
-    /* Loop bounded for verifier (max 64 CPUs for mask) */
+    
+    /* Loop bounded for verifier (max 64 CPUs) */
     for (s32 i = 0; i < 64; i++) {
         if (i >= nr_cpus) break;
         bpf_rcu_read_lock();
         struct task_struct *p = scx_bpf_cpu_curr(i);
-        /* If idle task is running, set the bit */
-        if (p && p->pid == 0) init_mask |= (1ULL << i);
+        /* If idle task is running, set the byte */
+        if (p && p->pid == 0) idle_map.as_bytes[i] = 1;
         bpf_rcu_read_unlock();
     }
-    /* Direct assignment to global (no concurrency on init) */
-    idle_mask = init_mask;
+    /* Note: auto-zeroed by BSS, so no need to clear '0' entries */
 
     /* Create all 7 dispatch queues in priority order */
     ret = scx_bpf_create_dsq(CRITICAL_LATENCY_DSQ, -1);
