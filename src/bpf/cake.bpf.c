@@ -87,21 +87,10 @@ struct {
  */
 u64 victim_mask SEC(".bss") __attribute__((aligned(64)));
 
-/*
- * DSQ Non-Empty Mask (Lock-Free DSQ Tracking)
- * 
- * CACHE ISOLATION OPTIMIZATION:
- * We align to 64 bytes to prevent False Sharing with 'victim_mask'.
- * 'victim_mask' is written frequently in the hot path. If they share a 
- * cache line, the Dispatcher suffers constant L1 cache misses.
+/* NOTE: dsq_has_tasks flag system was removed.
+ * Flags became permanently dirty (never cleared) and provided no benefit.
+ * scx_bpf_dsq_move_to_local handles empty queues efficiently (~10 cycles).
  */
-struct {
-    u32 flags[8];
-    u32 __pad[8]; /* Explicit padding to fill the 64-byte line */
-} dsq_state SEC(".bss") __attribute__((aligned(64)));
-
-/* Convenience macro so you don't have to rewrite code */
-#define dsq_has_tasks dsq_state.flags
 
 /*
  * Global CPU Tier Array (The "Scoreboard")
@@ -280,16 +269,25 @@ struct {
 
 /*
  * Get or initialize task context
+ * 
+ * LAZY ALLOCATION: Pass create=false for fast-path lookups (no malloc).
+ * Pass create=true only in cake_running (serialized per-CPU, no contention).
+ * This eliminates malloc lock contention at scheduler startup.
  */
-static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p)
+static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p, bool create)
 {
     struct cake_task_ctx *ctx;
 
+    /* Fast path: lookup existing context */
     ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if (ctx)
         return ctx;
 
-    /* Initialize new context */
+    /* If caller doesn't want allocation, return NULL */
+    if (!create)
+        return NULL;
+
+    /* Slow path: allocate new context (only from cake_running) */
     ctx = bpf_task_storage_get(&task_ctx, p, 0,
                                BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (!ctx)
@@ -328,9 +326,9 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     bool is_idle = false;
     s32 cpu;
 
-    tctx = get_task_ctx(p);
+    tctx = get_task_ctx(p, false);  /* No allocation - fast path */
     if (unlikely(!tctx)) {
-        /* Fallback if we can't get context */
+        /* No context yet - use kernel default (task will get context in cake_running) */
         return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     }
 
@@ -438,9 +436,9 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     u8 tier;
     u64 dsq_id;
 
-    tctx = get_task_ctx(p);
+    tctx = get_task_ctx(p, false);  /* No allocation - fast path */
     if (unlikely(!tctx)) {
-        /* Fallback: dispatch to interactive DSQ */
+        /* No context yet - use INTERACTIVE defaults (context created in cake_running) */
         scx_bpf_dsq_insert(p, INTERACTIVE_DSQ, quantum_ns, enq_flags);
         return;
     }
@@ -493,9 +491,6 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
      */
     u64 slice = tctx->next_slice;
 
-    /* Mark DSQ as non-empty (atomic byte write - no LOCK needed) */
-    dsq_has_tasks[tier] = 1;
-
     scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
 }
 
@@ -503,64 +498,33 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
  * Dispatch tasks to run on this CPU
  * 
  * DSQs are served in strict priority order:
- *   1. Critical Latency (true input handlers - score=100, <250µs avg)
- *   2. Realtime (score=100, >=250µs avg)
+ *   1. Critical Latency (true input handlers)
+ *   2. Realtime (ultra-sparse tasks)
  *   3. Critical (audio, compositor)
  *   4. Gaming (sparse/bursty)
  *   5. Interactive (normal apps)
  *   6. Batch (nice > 0)
  *   7. Background (bulk work)
  *
- * Starvation protection: Probabilistically check lower tiers
- * even if higher tiers have work, to prevent complete starvation.
- *
- * OPTIMIZATION: Removed global dispatch_count which caused cache-line
- * contention across all CPUs. Now uses timestamp-based probabilistic
- * approach - roughly every 16 dispatches per-CPU without contention.
+ * NOTE: No flag pre-checks. scx_bpf_dsq_move_to_local returns false on empty
+ * queues (~10 cycles). Flags became permanently dirty and provided no benefit.
  */
 void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 {
-    /*
-     * Starvation protection: probabilistically let lower tiers run
-     */
-    /*
-     * Processing Loop with Double-Checked Clearing
-     * We iterate manually to apply the double-check logic for each DSQ.
-     */
-    
-    /*
-     * ROCKET SHIP DISPATCH LOGIC (With Cache Hit Optimization)
-     * 
-     * 1. Check Flag (L1 Cache Hit - 1 cycle): 
-     *    Thanks to alignment, this is instant. It filters out unused queues.
-     * 2. Check Count (Helper Call - ~10 cycles):
-     *    Filters out empty queues without locking/atomic clearing.
-     * 3. Move Tasks (Heavy):
-     *    Only executes if work is guaranteed.
-     */
-    #define TRY_DISPATCH(ds_id) \
-        if (dsq_has_tasks[ds_id]) { \
-            if (scx_bpf_dsq_nr_queued(ds_id) > 0) { \
-                if (scx_bpf_dsq_move_to_local(ds_id)) return; \
-            } \
-        }
-
-    /* Starvation Protection */
+    /* Starvation Protection: probabilistically boost low-priority queues */
     if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
-        TRY_DISPATCH(BACKGROUND_DSQ);
-        TRY_DISPATCH(INTERACTIVE_DSQ);
+        if (scx_bpf_dsq_move_to_local(BACKGROUND_DSQ)) return;
+        if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ)) return;
     }
     
-    /* Priority Dispatch */
-    TRY_DISPATCH(CRITICAL_LATENCY_DSQ);
-    TRY_DISPATCH(REALTIME_DSQ);
-    TRY_DISPATCH(CRITICAL_DSQ);
-    TRY_DISPATCH(GAMING_DSQ);
-    TRY_DISPATCH(INTERACTIVE_DSQ);
-    TRY_DISPATCH(BATCH_DSQ);
-    TRY_DISPATCH(BACKGROUND_DSQ);
-    
-    #undef TRY_DISPATCH
+    /* Priority Dispatch (move_to_local is fast ~10 cycles on empty) */
+    if (scx_bpf_dsq_move_to_local(CRITICAL_LATENCY_DSQ)) return;
+    if (scx_bpf_dsq_move_to_local(REALTIME_DSQ)) return;
+    if (scx_bpf_dsq_move_to_local(CRITICAL_DSQ)) return;
+    if (scx_bpf_dsq_move_to_local(GAMING_DSQ)) return;
+    if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ)) return;
+    if (scx_bpf_dsq_move_to_local(BATCH_DSQ)) return;
+    if (scx_bpf_dsq_move_to_local(BACKGROUND_DSQ)) return;
 }
 
 /*
@@ -572,7 +536,8 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
  */
 void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 {
-    struct cake_task_ctx *tctx = get_task_ctx(p);
+    /* LAZY ALLOCATION: Create context here (serialized per-CPU, no contention) */
+    struct cake_task_ctx *tctx = get_task_ctx(p, true);
     if (unlikely(!tctx))
         return;
 
@@ -585,15 +550,22 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     /* Unconditional scoreboard write (1 store vs read+cmp+branch+store) */
     cpu_status[cpu_idx].tier = tier;
     
-    /* Unconditional victim_mask update (Racy Write / Heuristic) */
-    u64 mask = victim_mask;
+    /* 
+     * TEST-AND-TEST-AND-SET: Avoid cache line bouncing
+     * Only write if the bit is actually different.
+     * Prevents MESI invalidation on all 64 cores every context switch.
+     */
+    u64 current_mask = victim_mask;
     u64 cpu_bit = (1ULL << cpu_idx);
+    
     if (tier >= INTERACTIVE_DSQ) {
-        /* RACY SET: If multiple CPUs write, we might lose a bit. Acceptable. */
-        victim_mask = mask | cpu_bit;
+        /* Only write if bit is NOT already set */
+        if (!(current_mask & cpu_bit))
+            victim_mask = current_mask | cpu_bit;
     } else {
-        /* RACY CLEAR */
-        victim_mask = mask & ~cpu_bit;
+        /* Only write if bit IS currently set */
+        if (current_mask & cpu_bit)
+            victim_mask = current_mask & ~cpu_bit;
     }
 
     tctx->last_run_at = (u32)scx_bpf_now();
@@ -609,17 +581,24 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
  */
 void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 {
-    struct cake_task_ctx *tctx = get_task_ctx(p);
+    struct cake_task_ctx *tctx = get_task_ctx(p, false);  /* No allocation */
     if (unlikely(!tctx || tctx->last_run_at == 0))
         return;
 
     /* Runtime calculation: 3 ops */
     u64 runtime = (u32)scx_bpf_now() - tctx->last_run_at;
     
-    /* Sparse count update: 3 ops */
+    /* 
+     * Sparse count update (Branchless - eliminates pipeline stalls)
+     * Instead of ternary (branch), use arithmetic mask.
+     * If sparse: mask = 0xFFFFFFFF, keeps (count+1)
+     * If batch:  mask = 0, clears to 0
+     */
     u32 packed = tctx->packed_info;
     u32 old_count = (packed >> SHIFT_SPARSE_COUNT) & MASK_SPARSE_COUNT;
-    u32 new_count = (runtime < cached_threshold_ns) ? ((old_count + 1) & MASK_SPARSE_COUNT) : 0;
+    u32 is_sparse = runtime < cached_threshold_ns;
+    u32 mask = -(s32)is_sparse;  /* 0xFFFFFFFF if sparse, 0x00000000 if not */
+    u32 new_count = ((old_count + 1) & MASK_SPARSE_COUNT) & mask;
     
     /* Stats (compiled out when enable_stats=false) */
     if (enable_stats) {
@@ -671,7 +650,7 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 {
     struct cake_task_ctx *tctx;
 
-    tctx = get_task_ctx(p);
+    tctx = get_task_ctx(p, false);  /* No allocation */
     if (unlikely(!tctx))
         return;
 
