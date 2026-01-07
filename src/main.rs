@@ -92,13 +92,8 @@ impl<'a> Scheduler<'a> {
             rodata.starvation_ns = args.starvation * 1000;
             rodata.enable_stats = args.verbose;  // Only collect stats when --verbose is used
             
-            // Set topology flags (enables zero-cost dead code elimination)
-            rodata.has_dual_ccd = topo.has_dual_ccd;
-            rodata.has_hybrid_cores = topo.has_hybrid_cores;
-            rodata.ccd0_mask = topo.ccd0_mask;
-            rodata.ccd1_mask = topo.ccd1_mask;
-            rodata.p_core_mask = topo.p_core_mask;
-            rodata.cpus_per_ccd = topo.cpus_per_ccd;
+            // NOTE: Topology variables removed from BPF code (were never used)
+            // Future: Re-add when CCD-local or P-core preference is implemented
         }
 
         // Load the BPF program
