@@ -51,44 +51,51 @@ enum cake_flow_flags {
 };
 
 /*
- * Per-task flow state tracked in BPF (20 bytes used)
- * Fits 3 contexts per 64-byte cache line if packed tightly,
- * but padded here to 64B to prevent False Sharing.
- * * COMPRESSION:
+ * Per-task flow state tracked in BPF (24 bytes used)
+ * Padded to 64B to prevent False Sharing.
+ * 
+ * COMPRESSION:
  * - Timestamps: u32 (Wraps every 4.2s) - Acceptable for active gaming.
  * - Info: Packed into single u32 bitfield.
  */
 struct cake_task_ctx {
-    u64 next_slice;        /* 8B: OPTIMIZATION: Pre-computed slice (ns) */
-    u32 last_run_at;       /* 4B: Last run (ns), wraps 4.2s */
-    u32 packed_info;       /* 4B: Bitfield (Err, Score, Tier, Flags) */
+    u64 next_slice;        /* 8B: Pre-computed slice (ns) */
+    u32 last_run_at;       /* 4B: Last run timestamp (ns), wraps 4.2s */
+    u32 last_wake_ts;      /* 4B: Wake timestamp for wait budget */
+    u32 packed_info;       /* 4B: Bitfield (Err, Wait, Score, Tier, Flags) */
     u16 deficit_us;        /* 2B: Deficit (us), max 65ms */
-    u16 avg_runtime_us;    /* 2B: HFT Kalman Estimate */
-    u8 __pad[44];          /* Pad to 64 bytes (Cache Line Size) */
+    u16 avg_runtime_us;    /* 2B: EMA runtime estimate */
+    u8 __pad[40];          /* Pad to 64 bytes (Cache Line Size) */
 };
 
-/* * Bitfield Offsets for packed_info 
- * NOTE: Wait Data (Bits 8-15) is now unused/reserved hole.
+/* 
+ * Bitfield Offsets for packed_info
+ * Layout: [Flags:4][Tier:3][Score:7][Wait:8][Error:8]
  */
 #define SHIFT_KALMAN_ERROR  0
-/* Bits 8-15 Unused (formerly WAIT_DATA) */
-#define SHIFT_SPARSE_COUNT  16
-#define SHIFT_TIER          21
-#define SHIFT_FLAGS         24
-/* 28-31 Reserved */
+#define SHIFT_WAIT_DATA     8
+#define SHIFT_SPARSE_SCORE  16
+#define SHIFT_TIER          23
+#define SHIFT_FLAGS         26
+/* 30-31 Reserved */
 
-#define MASK_KALMAN_ERROR   0xFF
-/* MASK_WAIT_DATA Removed */
-#define MASK_SPARSE_COUNT   0x1F  /* 5 bits: 0-31 */
-#define MASK_TIER           0x07
-#define MASK_FLAGS          0x0F
+#define MASK_KALMAN_ERROR   0xFF  /* 8 bits: 0-255 */
+#define MASK_WAIT_DATA      0xFF  /* 8 bits: violations<<4 | checks */
+#define MASK_SPARSE_SCORE   0x7F  /* 7 bits: 0-127, clamped to 0-100 */
+#define MASK_TIER           0x07  /* 3 bits: 0-7 */
+#define MASK_FLAGS          0x0F  /* 4 bits */
 
-/* Delta scoring thresholds */
-#define SPARSE_COUNT_INTERACTIVE 4   /* count >= 4 = Interactive tier */
-#define SPARSE_COUNT_GAMING      8   /* count >= 8 = Gaming tier */
-#define SPARSE_COUNT_CRITICAL   16   /* count >= 16 = Critical tier */
-#define SPARSE_COUNT_REALTIME   24   /* count >= 24 = Realtime tier */
-#define SPARSE_COUNT_MAX        31   /* count >= 31 = Critical Latency */
+/* Sparse score thresholds (0-100 scale) */
+#define THRESHOLD_BACKGROUND    0    /* score < 30 = Background */
+#define THRESHOLD_BATCH        30    /* score >= 30 = Batch */
+#define THRESHOLD_INTERACTIVE  50    /* score >= 50 = Interactive */
+#define THRESHOLD_GAMING       70    /* score >= 70 = Gaming */
+#define THRESHOLD_CRITICAL     90    /* score >= 90 = Critical */
+#define THRESHOLD_REALTIME    100    /* score == 100 = Realtime+ */
+
+/* Latency gates for score=100 tasks */
+#define LATENCY_GATE_CRITICAL   50   /* < 50µs avg → Critical Latency (tier 0) */
+#define LATENCY_GATE_REALTIME  500   /* < 500µs avg → Realtime (tier 1) */
 
 /*
  * Statistics shared with userspace
@@ -99,11 +106,13 @@ struct cake_stats {
     u64 nr_tier_dispatches[CAKE_TIER_MAX]; /* Per-tier dispatch counts */
     u64 nr_sparse_promotions;      /* Sparse flow promotions */
     u64 nr_sparse_demotions;       /* Sparse flow demotions */
-    /* * REMOVED: Wait stats (nr_wait_demotions, total_wait_ns, etc)
-     * These were removed to optimize context switch performance.
-     */
+    /* Wait budget stats (CAKE's AQM) */
+    u64 nr_wait_demotions;         /* Demotions due to wait budget violation */
+    u64 total_wait_ns;             /* Total wait time accumulated */
+    u64 nr_waits;                  /* Number of waits tracked */
+    u64 max_wait_ns;               /* Maximum observed wait time */
     u64 nr_starvation_preempts_tier[CAKE_TIER_MAX]; /* Per-tier starvation preempts */
-    u64 nr_input_preempts;                 /* Preemptions injected for input/latency */
+    u64 nr_input_preempts;         /* Preemptions injected for input/latency */
 };
 
 /*
@@ -117,10 +126,10 @@ struct cake_stats {
  */
 
 /* Default values */
-#define CAKE_DEFAULT_QUANTUM_NS         (2 * 1000 * 1000)   /* 2ms */
+#define CAKE_DEFAULT_QUANTUM_NS         (4 * 1000 * 1000)   /* 4ms */
 #define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)   /* 8ms */
-#define CAKE_DEFAULT_SPARSE_THRESHOLD   50                  /* 5% = 50 permille */
-#define CAKE_DEFAULT_INIT_COUNT         0                   /* Initial sparse count */
+#define CAKE_DEFAULT_SPARSE_THRESHOLD   100                  /* 10% = 100 permille */
+#define CAKE_DEFAULT_INIT_COUNT         20                   /* Initial sparse count */
 #define CAKE_DEFAULT_STARVATION_NS      (100 * 1000 * 1000) /* 100ms */
 
 #endif /* __CAKE_INTF_H */

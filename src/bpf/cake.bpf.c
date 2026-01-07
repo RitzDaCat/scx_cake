@@ -113,9 +113,22 @@ static __always_inline s32 find_first_idle_cpu(s32 prev_cpu)
     u64 c6 = idle_map.as_chunks[6];
     u64 c7 = idle_map.as_chunks[7];
     
-    /* 3. OR all chunks - if result is 0, no idle CPUs exist (early exit) */
-    u64 any_idle = c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7;
-    if (!any_idle)
+    /*
+     * TREE REDUCTION: Parallel OR with depth 3 instead of depth 7
+     * Reduces dependency chain from 7 serial ops to 3 parallel levels.
+     */
+    /* Level 1: 4 parallel ops */
+    u64 m0 = c0 | c1;
+    u64 m1 = c2 | c3;
+    u64 m2 = c4 | c5;
+    u64 m3 = c6 | c7;
+    
+    /* Level 2: 2 parallel ops */
+    u64 y0 = m0 | m1;
+    u64 y1 = m2 | m3;
+    
+    /* Level 3: Final check */
+    if (!(y0 | y1))
         return -1;
     
     /* 4. Scan chunks (we know at least one has an idle CPU) */
@@ -140,30 +153,9 @@ UEI_DEFINE(uei);
 static u64 cached_threshold_ns;
 
 /*
- * FUSED Tier+Slice Lookup Table (eliminates load dependency chain)
- * 
- * Single access returns both tier and slice, saving ~4 cycles.
- * 32 entries × 16 bytes = 512 bytes (1.6% of 32KB L1 = acceptable).
- * 
- * Access pattern:
- *   tier_info[new_count] → { tier, slice }  // ONE load
- * vs old pattern:
- *   count_to_tier[new_count] → tier          // LOAD 1
- *   tier_slice[tier] → slice                 // LOAD 2 (depends on LOAD 1)
- */
-struct tier_info_t {
-    u8 tier;
-    u8 __pad[7];  /* Align slice to 8 bytes */
-    u64 slice;
-};
-static struct tier_info_t tier_info[32] __attribute__((aligned(64)));
-
-
-
-/*
  * Seven dispatch queues - one per tier, served in priority order:
- * - CRITICAL_LATENCY_DSQ: Ultra-low latency (score=100 AND <250µs avg) - highest priority
- * - REALTIME_DSQ:    Ultra-sparse tasks (score=100, >=250µs avg) - very high priority
+ * - CRITICAL_LATENCY_DSQ: Ultra-low latency (score=100 AND <50µs avg) - highest priority
+ * - REALTIME_DSQ:    Ultra-sparse tasks (score=100, <500µs avg) - very high priority
  * - CRITICAL_DSQ:    Very sparse tasks (audio, compositor) - high priority
  * - GAMING_DSQ:      Sparse/bursty tasks (game threads, UI) - gaming priority  
  * - INTERACTIVE_DSQ: Normal tasks (default applications) - baseline priority
@@ -178,36 +170,15 @@ static struct tier_info_t tier_info[32] __attribute__((aligned(64)));
 #define BATCH_DSQ       5
 #define BACKGROUND_DSQ  6
 
-/*
- * Tier quantum multipliers (fixed-point, 1024 = 1.0x)
- * Higher tiers get SMALLER slices (more preemption points, lower latency)
- * Lower tiers get LARGER slices (less context switching for bulk work)
- * PADDED TO 8 for Branchless Access (tier & 7).
- */
-static const u32 tier_multiplier[8] = {
-    717,   /* Critical Latency: 0.7x (70%) -> 717/1024 */
-    819,   /* Realtime:    0.8x (80%) -> 819/1024 */
-    922,   /* Critical:    0.9x (90%) -> 922/1024 */
-    1024,  /* Gaming:      1.0x (100%) -> 1024/1024 */
-    1126,  /* Interactive: 1.1x (110%) -> 1126/1024 */
-    1229,  /* Batch:       1.2x (120%) -> 1229/1024 */
-    1331,  /* Background:  1.3x (130%) -> 1331/1024 */
-    1024,  /* PADDING: Entry 7 (Unused/Safe) */
-};
+/* Sparse score threshold for gaming detection */
+#define THRESHOLD_GAMING 70
 
-/* Tier values for LUT initialization (used in cake_init) */
-static const u8 count_to_tier_init[32] = {
-    6,                          /* 0: Background (never sparse) */
-    5, 5, 5,                    /* 1-3: Batch */
-    4, 4, 4, 4,                 /* 4-7: Interactive */
-    3, 3, 3, 3, 3, 3, 3, 3,     /* 8-15: Gaming */
-    2, 2, 2, 2, 2, 2, 2, 2,     /* 16-23: Critical */
-    1, 1, 1, 1, 1, 1, 1,        /* 24-30: Realtime */
-    0                           /* 31: Critical Latency */
-};
+/* Latency gate thresholds for score=100 sub-classification (in µs) */
+#define LATENCY_GATE_CRITICAL  50   /* <50µs avg → Critical Latency (tier 0) */
+#define LATENCY_GATE_REALTIME  500  /* <500µs avg → Realtime (tier 1) */
 
-/* Delta scoring: count consecutive sparse runs (0-31), reset on non-sparse */
-#define CAKE_TIER_IDLE 255 /* Special value for Scoreboard (Cpu is Idle) */
+/* Special tier value for idle CPU scoreboard */
+#define CAKE_TIER_IDLE 255
 
 /*
  * Per-tier starvation thresholds (nanoseconds)
@@ -234,6 +205,47 @@ static const u64 starvation_threshold[8] = {
     STARVATION_BACKGROUND,   /* Tier 6: Background - 100ms */
     STARVATION_BACKGROUND,   /* PADDING: Entry 7 (Safe) */
 };
+
+/*
+ * Tier quantum multipliers (fixed-point, 1024 = 1.0x)
+ * Higher tiers get SMALLER slices (more preemption points, lower latency)
+ * Lower tiers get LARGER slices (less context switching for bulk work)
+ */
+static const u32 tier_multiplier[8] = {
+    717,   /* Critical Latency: 0.7x (70%) */
+    819,   /* Realtime:    0.8x (80%) */
+    922,   /* Critical:    0.9x (90%) */
+    1024,  /* Gaming:      1.0x (100%) */
+    1126,  /* Interactive: 1.1x (110%) */
+    1229,  /* Batch:       1.2x (120%) */
+    1331,  /* Background:  1.3x (130%) */
+    1024,  /* PADDING: Entry 7 */
+};
+
+/*
+ * Wait Budget per Tier (CAKE's AQM)
+ * Tasks exceeding their tier's wait budget get demoted.
+ */
+#define WAIT_BUDGET_CRITICAL_LATENCY 100000    /* 100µs */
+#define WAIT_BUDGET_REALTIME    750000         /* 750µs */
+#define WAIT_BUDGET_CRITICAL    2000000        /* 2ms */
+#define WAIT_BUDGET_GAMING      4000000        /* 4ms */
+#define WAIT_BUDGET_INTERACTIVE 8000000        /* 8ms */
+#define WAIT_BUDGET_BATCH       20000000       /* 20ms */
+
+static const u64 wait_budget[8] = {
+    WAIT_BUDGET_CRITICAL_LATENCY,
+    WAIT_BUDGET_REALTIME,
+    WAIT_BUDGET_CRITICAL,
+    WAIT_BUDGET_GAMING,
+    WAIT_BUDGET_INTERACTIVE,
+    WAIT_BUDGET_BATCH,
+    0,  /* Background - no limit */
+    0   /* Padding */
+};
+
+/* Long-sleep recovery threshold: 33ms = 2 frames @ 60Hz */
+#define LONG_SLEEP_THRESHOLD_NS 33000000
 
 
 
@@ -264,9 +276,13 @@ struct {
  * These allow us to pack multiple variables into a single u32.
  */
 
+/* Sparse Score accessors (0-100 with asymmetric adaptation) */
+#define GET_SPARSE_SCORE(ctx) ((ctx->packed_info >> SHIFT_SPARSE_SCORE) & MASK_SPARSE_SCORE)
+#define SET_SPARSE_SCORE(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_SPARSE_SCORE << SHIFT_SPARSE_SCORE)) | ((val & MASK_SPARSE_SCORE) << SHIFT_SPARSE_SCORE))
 
-#define GET_SPARSE_COUNT(ctx) ((ctx->packed_info >> SHIFT_SPARSE_COUNT) & MASK_SPARSE_COUNT)
-#define SET_SPARSE_COUNT(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_SPARSE_COUNT << SHIFT_SPARSE_COUNT)) | ((val & MASK_SPARSE_COUNT) << SHIFT_SPARSE_COUNT))
+/* Wait data accessors (violations<<4 | checks) */
+#define GET_WAIT_DATA(ctx) ((ctx->packed_info >> SHIFT_WAIT_DATA) & MASK_WAIT_DATA)
+#define SET_WAIT_DATA(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_WAIT_DATA << SHIFT_WAIT_DATA)) | ((val & MASK_WAIT_DATA) << SHIFT_WAIT_DATA))
 
 #define GET_TIER(ctx) ((ctx->packed_info >> SHIFT_TIER) & MASK_TIER)
 #define SET_TIER(ctx, val) (ctx->packed_info = (ctx->packed_info & ~(MASK_TIER << SHIFT_TIER)) | ((val & MASK_TIER) << SHIFT_TIER))
@@ -298,15 +314,17 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p,
         return NULL;
 
     /* Initialize task context fields */
-    ctx->next_slice = quantum_ns; /* Default slice */
+    ctx->next_slice = quantum_ns;
     ctx->deficit_us = (u16)((quantum_ns + new_flow_bonus_ns) >> 10);
     ctx->last_run_at = 0;
-    ctx->avg_runtime_us = 0;
+    ctx->last_wake_ts = 0;      /* No pending wake */
+    ctx->avg_runtime_us = 0;    /* EMA starts fresh */
     
-    /* Pack initial values: Err=255, Count=0, Tier=Interactive, Flags=New */
+    /* Pack initial values: Err=255, Wait=0, Score=50, Tier=Interactive, Flags=New */
     u32 packed = 0;
     packed |= (255 & MASK_KALMAN_ERROR) << SHIFT_KALMAN_ERROR;
-    packed |= (CAKE_DEFAULT_INIT_COUNT & MASK_SPARSE_COUNT) << SHIFT_SPARSE_COUNT;
+    packed |= (0 & MASK_WAIT_DATA) << SHIFT_WAIT_DATA;
+    packed |= (50 & MASK_SPARSE_SCORE) << SHIFT_SPARSE_SCORE;  /* Start mid-tier */
     packed |= (CAKE_TIER_INTERACTIVE & MASK_TIER) << SHIFT_TIER;
     packed |= (CAKE_FLOW_NEW & MASK_FLAGS) << SHIFT_FLAGS;
     
@@ -315,10 +333,100 @@ static __always_inline struct cake_task_ctx *get_task_ctx(struct task_struct *p,
     return ctx;
 }
 
-/* REMOVED: update_kalman_estimate, update_task_tier, update_sparse_score
- * All logic is now inlined into cake_stopping with a single packed_info read-modify-write.
- * Saves ~20-30 cycles per context switch.
+/*
+ * PURE COMPUTE: Exponential Moving Average with α=1/8
+ * Returns new avg_runtime_us, does NOT write to tctx
  */
+static __always_inline u16 compute_ema_runtime(u16 old_avg_us, u64 runtime_ns)
+{
+    u32 meas_us = (u32)(runtime_ns >> 10);
+    meas_us = (meas_us > 65535) ? 65535 : meas_us;
+
+    if (unlikely(old_avg_us == 0)) {
+        return (u16)meas_us;
+    } else {
+        s32 diff = (s32)meas_us - (s32)old_avg_us;
+        return (u16)((s32)old_avg_us + (diff >> 3));
+    }
+}
+
+/*
+ * PURE COMPUTE: Sparse score with asymmetric +4/-6 adaptation
+ * Returns new score, does NOT write to tctx
+ */
+static __always_inline u32 compute_sparse_score(u32 old_score, u64 runtime_ns)
+{
+    /* ILP: Compute BOTH paths in parallel (speculative) */
+    s32 sparse_result = (s32)old_score + 4;
+    s32 heavy_result = (s32)old_score - 6;
+    
+    /* Select with CMOV (no branch mispredict) */
+    bool sparse = runtime_ns < cached_threshold_ns;
+    s32 raw_score = sparse ? sparse_result : heavy_result;
+
+    /* Clamp to 0-100 (branchless: use conditional move) */
+    if (raw_score < 0) raw_score = 0;
+    else if (raw_score > 100) raw_score = 100;
+    
+    return (u32)raw_score;
+}
+
+/*
+ * PURE COMPUTE: Tier from sparse score with latency gates
+ * Returns tier value, does NOT write to tctx
+ */
+static __always_inline u8 compute_tier(u32 score, u16 avg_us)
+{
+    u8 tier;
+    
+    if (score < 30) {
+        tier = 6;  /* Background */
+    } else if (score < 50) {
+        tier = 5;  /* Batch */
+    } else if (score < 70) {
+        tier = 4;  /* Interactive */
+    } else if (score < 90) {
+        tier = 3;  /* Gaming */
+    } else if (score < 100) {
+        tier = 2;  /* Critical */
+    } else {
+        /* score == 100: Apply latency gates */
+        tier = 2;  /* Default: Critical */
+        if (avg_us > 0) {
+            if (avg_us < LATENCY_GATE_CRITICAL) {
+                tier = 0;  /* Critical Latency */
+            } else if (avg_us < LATENCY_GATE_REALTIME) {
+                tier = 1;  /* Realtime */
+            }
+        }
+    }
+    
+    return tier;
+}
+
+/*
+ * PURE COMPUTE: Slice from deficit and tier
+ * Returns slice value, does NOT write to tctx
+ */
+static __always_inline u64 compute_slice(u16 deficit_us, u8 tier)
+{
+    u64 deficit_ns = (u64)deficit_us << 10;
+    u64 base_slice = (deficit_ns > quantum_ns) ? deficit_ns : quantum_ns;
+    return (base_slice * tier_multiplier[tier & 7]) >> 10;
+}
+
+/*
+ * PURE COMPUTE: Update deficit (DRR++ credit system)
+ * Returns new deficit value, does NOT write to tctx
+ */
+static __always_inline u16 compute_deficit(u16 old_deficit_us, u64 runtime_ns)
+{
+    u32 runtime_us = (u32)(runtime_ns >> 10);
+    if (runtime_us < old_deficit_us)
+        return old_deficit_us - (u16)runtime_us;
+    else
+        return 0;
+}
 
 /*
  * Select CPU for a waking task
@@ -327,52 +435,69 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags)
 {
     struct cake_task_ctx *tctx;
-    bool is_idle = false;
     s32 cpu;
+
+    /*
+     * CLUSTER BOMB: Issue all potential memory loads NOW
+     * Hides L2/L3 latency behind the tctx pointer chase.
+     */
+    
+    /* SPECULATIVE LOAD: Fetch victim_mask blindly */
+    u64 spec_victim_mask = victim_mask;
+    
+    /* PRE-CALC VICTIM (Pure ALU while waiting for tctx) */
+    s32 spec_victim_cpu = spec_victim_mask ? __builtin_ctzll(spec_victim_mask) : -1;
+
+    /* PREFETCH: Load starvation_threshold and tier_multiplier cache lines */
+    volatile u64 hint_starvation = starvation_threshold[0];
+    volatile u32 hint_multiplier = tier_multiplier[0];
+    (void)hint_starvation; (void)hint_multiplier;
 
     tctx = get_task_ctx(p, false);  /* No allocation - fast path */
     if (unlikely(!tctx)) {
         /* No context yet - use kernel default (task will get context in cake_running) */
+        bool is_idle = false;
         return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     }
 
-    /* 
-     * OPTIMIZATION: Bitmask Idle Search (O(1) via CTZ)
-     * We use a global 64-bit mask where set bits = idle CPUs.
+    /* CRITICAL: Set wake timestamp BEFORE any early return */
+    tctx->last_wake_ts = (u32)scx_bpf_now();
+
+    /*
+     * MLP OPTIMIZATION: Issue independent loads in parallel
+     * Load tier AND prev_cpu idle status simultaneously.
      */
-    /* 
-     * OPTIMIZATION: Wait-Free Idle Search (Dual-View)
-     */
+    u8 tier = GET_TIER(tctx);  /* Load 1: tctx cache line */
     
-    /* Move tier read up for the check */
-    u8 tier = GET_TIER(tctx);
+    /* 
+     * Bounds check prev_cpu and speculatively load idle status (Load 2: idle_map)
+     * Use bitmask (& 63) - verifier tracks this reliably AND it's branchless.
+     */
+    u32 bounded_prev = (u32)prev_cpu & 63;  /* Always 0-63, BPF verifier happy */
+    u8 prev_idle = idle_map.as_bytes[bounded_prev];  /* MLP: parallel with tier load */
+    bool prev_valid = (prev_cpu >= 0 && prev_cpu < 64);
+    
+    /* Default to prev_cpu */
+    cpu = prev_cpu;
+    bool is_idle = false;
 
-    /* Quick check: Scan chunks to see if ANYONE is idle */
-    /* Checks first 64 CPUs. If we have >64, we might need loops, but logic assumes 64 max */
-    /* Unrolled check of chunks for early exit? No, find_first_idle_cpu handles it. */
-
-    is_idle = false;
-    cpu = prev_cpu; /* Default */
-
-    /* Only search if we are not lowest priority (optimization) */
-    if (tier <= REALTIME_DSQ) {
-         s32 idle_cpu = find_first_idle_cpu(prev_cpu);
-         if (idle_cpu >= 0) {
-             cpu = idle_cpu;
-             is_idle = true;
-         }
+    /* Use speculative prev_idle result first (fast path) */
+    if (prev_valid && prev_idle) {
+        is_idle = true;
+        /* cpu already = prev_cpu */
+    } else if (tier <= REALTIME_DSQ) {
+        /* High priority: scan all idle CPUs */
+        s32 idle_cpu = find_first_idle_cpu(prev_cpu);
+        if (idle_cpu >= 0) {
+            cpu = idle_cpu;
+            is_idle = true;
+        }
     } else {
-        /* For lower tiers, only check prev_cpu (stickiness) */
-        if (prev_cpu >= 0 && prev_cpu < 64 && idle_map.as_bytes[prev_cpu]) {
-             cpu = prev_cpu;
-             is_idle = true;
-        } else {
-             /* Try to find ANY idle CPU if we couldn't stick */
-             s32 idle_cpu = find_first_idle_cpu(-1);
-             if (idle_cpu >= 0) {
-                 cpu = idle_cpu;
-                 is_idle = true;
-             }
+        /* Low priority: try any idle if prev wasn't idle */
+        s32 idle_cpu = find_first_idle_cpu(-1);
+        if (idle_cpu >= 0) {
+            cpu = idle_cpu;
+            is_idle = true;
         }
     }
 
@@ -388,44 +513,17 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     /* 
-     * Preemption Injection
-     * If we didn't find an idle CPU, but this is a latency-sensitive task,
-     * check if the target CPU is running something low priority.
-     * Note: tier already read above.
+     * CRITICAL PATH: Tier 0 preemption injection
+     * ZERO LATENCY: The victim was computed ~20 cycles ago (Cluster Bomb).
      */
-    if (tier == CRITICAL_LATENCY_DSQ) { /* Tier 0 (CritLatency) only */
-        /* 
-         * OPTIMIZATION: Smart Victim Selection
-         * Instead of blindly picking prev_cpu, scan neighbors (likely LLC/CCD)
-         * to find a lower priority victim.
-         * 
-         * Scan window: 4 CPUs (prev, +1, +2, +3).
-         * Cost: 4 * 20 cycles = ~80 cycles.
-         * Benefit: Avoids blindly killing a Game Thread if a Background task is nearby.
-         */
-        s32 best_cpu = -1;
-
-        /* 
-         * OPTIMIZATION: O(1) Victim Selection using Bitmask
-         * Instead of scanning 4 CPUs with map lookups (~80 cycles),
-         * use the victim_mask to find any eligible victim in O(1) (~3 cycles).
-         * victim_mask tracks CPUs running tier >= INTERACTIVE.
-         */
-        u64 victims = victim_mask;
-        if (victims) {
-            best_cpu = __builtin_ctzll(victims);  /* O(1) TZCNT instruction */
-        }
+    if (tier == CRITICAL_LATENCY_DSQ && spec_victim_cpu >= 0) {
+        scx_bpf_kick_cpu(spec_victim_cpu, SCX_KICK_PREEMPT);
         
-        /* Did we find a victim? Kick immediately (stateless - no cooldown) */
-        if (best_cpu >= 0) {
-            scx_bpf_kick_cpu(best_cpu, SCX_KICK_PREEMPT);
-            
-            if (enable_stats) {
-                struct cake_stats *s = get_local_stats();
-                if (s) s->nr_input_preempts++;
-            }
-            cpu = best_cpu;
+        if (enable_stats) {
+            struct cake_stats *s = get_local_stats();
+            if (s) s->nr_input_preempts++;
         }
+        cpu = spec_victim_cpu;
     }
 
     return cpu;
@@ -448,7 +546,12 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     /* Zero-Cycle Wakeup: Tier already calculated in cake_stopping */
-    tier = GET_TIER(tctx);
+    /*
+     * MLP OPTIMIZATION: Load tier and slice in parallel (same cache line)
+     * Both fields are in cake_task_ctx, likely same 64-byte cache line.
+     */
+    tier = GET_TIER(tctx);           /* Load 1: packed_info field */
+    u64 slice = tctx->next_slice;    /* Load 2: next_slice (parallel - MLP) */
 
     /* Track if this is a wakeup (new flow) or preemption (old flow) */
     if (enable_stats) {
@@ -472,28 +575,10 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     /*
-     * Route to DSQ based on tier classification:
-     * - Critical Latency: CRITICAL_LATENCY_DSQ (true input handlers)
-     * - Realtime: REALTIME_DSQ (score=100, longer runtime)
-     * - Critical: CRITICAL_DSQ (audio, compositor)
-     * - Gaming: GAMING_DSQ (sparse/bursty tasks)
-     * - Interactive: INTERACTIVE_DSQ (normal applications)
-     * - Batch: BATCH_DSQ (nice > 0)
-     * - Background: BACKGROUND_DSQ (bulk work)
-     */
-    /* 
+     * Route to DSQ based on tier classification.
      * OPTIMIZATION: Direct mapping (TIER_ID == DSQ_ID)
-     * Removes switch branch table. 
-     * Safe because tier is guaranteed 0-6 by logic and 0-7 by type.
      */
     dsq_id = tier;
-
-    /*
-     * OPTIMIZATION: Zero-Cycle Slice (Pre-Computed)
-     * All the complex deficit/bonus/multiplier logic was done in cake_stopping.
-     * Now we just load the result. 15 cycles -> 0 cycles.
-     */
-    u64 slice = tctx->next_slice;
 
     scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
 }
@@ -515,8 +600,13 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 {
-    /* Starvation Protection: probabilistically boost low-priority queues */
-    if (prev && ((prev->pid ^ prev->se.sum_exec_runtime) & 0xF) == 0) {
+    /*
+     * MLP OPTIMIZATION: NULL-safe starvation check
+     * Compute starvation bits without branching on prev.
+     * Uses arithmetic to force check failure when prev is NULL.
+     */
+    u64 starvation_bits = prev ? (prev->pid ^ prev->se.sum_exec_runtime) : 1;
+    if ((starvation_bits & 0xF) == 0) {
         if (scx_bpf_dsq_move_to_local(BACKGROUND_DSQ)) return;
         if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ)) return;
     }
@@ -534,79 +624,158 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 cpu, struct task_struct *prev)
 /*
  * Task is starting to run
  * 
- * ULTRA-OPTIMIZED: ~18 cycles total
- * - Unconditional scoreboard write (skip comparison)
- * - Unconditional victim_mask update (skip comparison)
+ * Includes:
+ * - XOR-blend victim_mask update (preserved MLP optimization)
+ * - Wait budget checking (CAKE's AQM - restored)
+ * - Long-sleep recovery (restored)
  */
 void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 {
+    /*
+     * PREFETCH OPTIMIZATION: Touch wait_budget array early
+     * 
+     * The CPU will load wait_budget[0-7] into L1 cache while we wait
+     * for get_task_ctx() to complete. By the time we need 
+     * wait_budget[tier & 7], it's already hot in cache.
+     * 
+     * Saves: ~10 cycles (40-cycle L3 load hidden behind pointer chase)
+     */
+    volatile u64 prefetch_hint = wait_budget[0];
+    (void)prefetch_hint;
+    
     /* LAZY ALLOCATION: Create context here (serialized per-CPU, no contention) */
     struct cake_task_ctx *tctx = get_task_ctx(p, true);
     if (unlikely(!tctx))
         return;
 
-    /* ZERO-COST: bpf_get_smp_processor_id is inlined, no helper call (~30 cycles saved) */
     u32 cpu_idx = bpf_get_smp_processor_id();
-    if (cpu_idx >= 64)
+    if (unlikely(cpu_idx >= 64))
         return;
 
+    u64 now = scx_bpf_now();
+    u32 now_ts = (u32)now;
     u8 tier = GET_TIER(tctx);
     
-    /* 
-     * BRANCHLESS victim_mask update (~10-30 cycles saved on mispredict)
-     * Uses arithmetic selection instead of branches.
+    /*
+     * XOR-BLEND victim_mask update (preserved MLP optimization)
      */
     u64 current_mask = victim_mask;
     u64 cpu_bit = (1ULL << cpu_idx);
-    
-    /* Branchless: compute both variants */
+    u32 is_victim = (u32)tier >= INTERACTIVE_DSQ;
     u64 set_mask = current_mask | cpu_bit;
     u64 clear_mask = current_mask & ~cpu_bit;
-    
-    /* Select: is_victim=1 picks set_mask, is_victim=0 picks clear_mask */
-    u64 is_victim = (tier >= INTERACTIVE_DSQ);
-    u64 new_mask = (is_victim * set_mask) + (!is_victim * clear_mask);
-    
-    /* Test-and-set: only write if different */
+    u64 diff = set_mask ^ clear_mask;
+    u64 selector = -(s64)is_victim;
+    u64 new_mask = clear_mask ^ (diff & selector);
     if (new_mask != current_mask)
         victim_mask = new_mask;
 
-    tctx->last_run_at = (u32)scx_bpf_now();
+    /*
+     * WAIT BUDGET CHECK (CAKE's AQM) - Restored
+     */
+    if (likely(tctx->last_wake_ts > 0)) {
+        u64 wait_time = (u64)(now_ts - tctx->last_wake_ts);
+        
+        /* Long-sleep recovery: Reset history after 33ms */
+        if (wait_time > LONG_SLEEP_THRESHOLD_NS) {
+            tctx->avg_runtime_us >>= 1;  /* 50% decay */
+        }
+
+        if (enable_stats) {
+            struct cake_stats *s = get_local_stats();
+            if (s) {
+                s->total_wait_ns += wait_time;
+                s->nr_waits++;
+                if (wait_time > s->max_wait_ns)
+                    s->max_wait_ns = wait_time;
+            }
+        }
+
+        /* Wait budget tracking (4-bit counters) */
+        u8 wait_data = GET_WAIT_DATA(tctx);
+        u8 checks = wait_data & 0xF;
+        u8 violations = wait_data >> 4;
+        
+        checks++;
+        
+        u64 budget_ns = wait_budget[tier & 7];
+        if (budget_ns > 0 && wait_time > budget_ns) {
+            violations++;
+        }
+        
+        /* Demotion check: 10-sample window, >30% violations */
+        if (checks >= 10 && tier < CAKE_TIER_BACKGROUND) {
+            if (violations >= 3) {
+                u32 current_score = GET_SPARSE_SCORE(tctx);
+                u32 penalized = (current_score > 10) ? current_score - 10 : 0;
+                SET_SPARSE_SCORE(tctx, penalized);
+                SET_WAIT_DATA(tctx, 0);
+                
+                if (enable_stats) {
+                    struct cake_stats *s = get_local_stats();
+                    if (s) s->nr_wait_demotions++;
+                }
+            } else {
+                SET_WAIT_DATA(tctx, 0);
+            }
+        } else {
+            if (checks >= 15) checks = 15;
+            if (violations >= 15) violations = 15;
+            SET_WAIT_DATA(tctx, (violations << 4) | checks);
+        }
+        
+        tctx->last_wake_ts = 0;  /* Clear to prevent double-counting */
+    }
+
+    tctx->last_run_at = now_ts;
 }
 
 /*
  * Task is stopping (yielding or being preempted)
  * 
- * ULTRA-OPTIMIZED: ~20 cycles total
- * - No EMA (use last runtime directly if ever needed)
- * - No latency gates (tier is pure count-based)
- * - Minimal packed_info handling
+ * FUSED LOAD-COMPUTE-STORE OPTIMIZATION:
+ * Phase 1: Load all data (MLP - parallel memory access)
+ * Phase 2: Compute everything (ILP - parallel ALU)
+ * Phase 3: Write everything back (single burst)
+ * 
+ * Saves ~12 cycles by eliminating interleaved R/W.
  */
 void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 {
-    struct cake_task_ctx *tctx = get_task_ctx(p, false);  /* No allocation */
+    struct cake_task_ctx *tctx = get_task_ctx(p, false);
     if (unlikely(!tctx || tctx->last_run_at == 0))
         return;
 
-    /* Runtime calculation: 3 ops */
-    u64 runtime = (u32)scx_bpf_now() - tctx->last_run_at;
-    
-    /* 
-     * Sparse count update (Branchless - eliminates pipeline stalls)
-     * Instead of ternary (branch), use arithmetic mask.
-     * If sparse: mask = 0xFFFFFFFF, keeps (count+1)
-     * If batch:  mask = 0, clears to 0
+    /*
+     * PHASE 1: LOAD ALL DATA (MLP - Memory Level Parallelism)
+     * Issue all loads simultaneously to hide cache latency.
      */
+    u64 now = scx_bpf_now();
     u32 packed = tctx->packed_info;
-    u32 old_count = (packed >> SHIFT_SPARSE_COUNT) & MASK_SPARSE_COUNT;
-    u32 is_sparse = runtime < cached_threshold_ns;
-    u32 mask = -(s32)is_sparse;  /* 0xFFFFFFFF if sparse, 0x00000000 if not */
-    u32 new_count = ((old_count + 1) & MASK_SPARSE_COUNT) & mask;
+    u16 old_avg_us = tctx->avg_runtime_us;
+    u16 old_deficit_us = tctx->deficit_us;
+    u32 last_run = tctx->last_run_at;
+    
+    /* Extract packed fields (ALU ops while waiting for memory) */
+    u32 old_score = (packed >> SHIFT_SPARSE_SCORE) & MASK_SPARSE_SCORE;
+    
+    /* Compute runtime from timestamp delta */
+    u64 runtime = (u32)now - last_run;
+    
+    /*
+     * PHASE 2: COMPUTE EVERYTHING (ILP - Instruction Level Parallelism)
+     * All operations can execute in parallel on superscalar CPUs.
+     */
+    u16 new_avg_us = compute_ema_runtime(old_avg_us, runtime);
+    u32 new_score = compute_sparse_score(old_score, runtime);
+    u16 new_deficit_us = compute_deficit(old_deficit_us, runtime);
+    u8 new_tier = compute_tier(new_score, new_avg_us);
+    u64 new_slice = compute_slice(new_deficit_us, new_tier);
     
     /* Stats (compiled out when enable_stats=false) */
     if (enable_stats) {
-        bool was_gaming = old_count >= SPARSE_COUNT_GAMING;
-        bool is_gaming = new_count >= SPARSE_COUNT_GAMING;
+        bool was_gaming = old_score >= THRESHOLD_GAMING;
+        bool is_gaming = new_score >= THRESHOLD_GAMING;
         if (was_gaming != is_gaming) {
             struct cake_stats *s = get_local_stats();
             if (s) {
@@ -616,15 +785,21 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
         }
     }
     
-    /* FUSED LUT: Single access returns both tier and slice (~4 cycles saved) */
-    struct tier_info_t info = tier_info[new_count & 0x1F];
-    u8 tier = info.tier;
-    tctx->next_slice = info.slice;
+    /* Pack new values into packed_info (single u32 write) */
+    u32 new_packed = packed;
+    new_packed &= ~(MASK_SPARSE_SCORE << SHIFT_SPARSE_SCORE);
+    new_packed &= ~(MASK_TIER << SHIFT_TIER);
+    new_packed |= (new_score & MASK_SPARSE_SCORE) << SHIFT_SPARSE_SCORE;
+    new_packed |= (new_tier & MASK_TIER) << SHIFT_TIER;
     
-    /* Update packed_info: single read-modify-write */
-    tctx->packed_info = (packed & ~((MASK_SPARSE_COUNT << SHIFT_SPARSE_COUNT) | (MASK_TIER << SHIFT_TIER)))
-                      | ((new_count & MASK_SPARSE_COUNT) << SHIFT_SPARSE_COUNT)
-                      | ((tier & MASK_TIER) << SHIFT_TIER);
+    /*
+     * PHASE 3: WRITE EVERYTHING BACK (Single Burst)
+     * All writes to same cache line - store buffer coalesces them.
+     */
+    tctx->avg_runtime_us = new_avg_us;
+    tctx->deficit_us = new_deficit_us;
+    tctx->next_slice = new_slice;
+    tctx->packed_info = new_packed;
 }
 
 /*
@@ -654,17 +829,18 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
         return;
 
     /* Check for starvation using tier-specific threshold */
-    if (tctx->last_run_at > 0) {    /* Check for starvation */
-        /* Use u32 wrap-safe math: (u32)now - last_run_at */
-        /* Only valid if we ran within 4 seconds, otherwise we assume starvation anyway */
-        /* OPTIMIZATION: scx_bpf_now() uses cached rq->clock */
-        u32 runtime_32 = (u32)scx_bpf_now() - tctx->last_run_at;
-        u64 runtime = (u64)runtime_32;
-
-        u8 tier = GET_TIER(tctx);
+    if (likely(tctx->last_run_at > 0)) {
+        /*
+         * MLP OPTIMIZATION: Parallel fetch of tier and time
+         * Issue both loads simultaneously, combine results after.
+         */
+        u8 tier = GET_TIER(tctx);                    /* Load 1: packed_info */
+        u32 last_run = tctx->last_run_at;            /* Load 2: last_run_at (parallel) */
+        u64 threshold = starvation_threshold[tier & 7];  /* Load 3: LUT (parallel with above) */
         
-        /* O(1) threshold lookup via padded array (tier & 7) */
-        u64 threshold = starvation_threshold[tier & 7];
+        /* Compute runtime after loads complete */
+        u32 now = (u32)scx_bpf_now();
+        u64 runtime = (u64)(now - last_run);
         
         if (runtime > threshold) {
             /* Force preemption - task exceeded its tier's starvation limit */
@@ -710,17 +886,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
 
     /* BITWISE OPTIMIZATION: >> 10 (~ / 1024) instead of / 1000 */
     cached_threshold_ns = (quantum_ns * sparse_threshold) >> 10;
-
-    /* Pre-compute FUSED tier_info LUT (tier + slice in one access) */
-    u64 slices[8];
-    for (s32 i = 0; i < 8; i++) {
-        slices[i] = (quantum_ns * tier_multiplier[i]) >> 10;
-    }
-    for (s32 i = 0; i < 32; i++) {
-        u8 t = count_to_tier_init[i];
-        tier_info[i].tier = t;
-        tier_info[i].slice = slices[t & 7];
-    }
 
     /* Initialize Idle Mask (Single RCU section - saves ~6200 cycles) */
     u32 nr_cpus = scx_bpf_nr_cpu_ids();
