@@ -321,7 +321,7 @@ impl<'a> Scheduler<'a> {
             rodata.starvation_threshold = args.profile.starvation_threshold();
             rodata.tier_multiplier = args.profile.tier_multiplier();
             rodata.wait_budget = args.profile.wait_budget();
-            
+
             // Topology arrays (zero runtime overhead)
             rodata.has_multi_llc = topo.has_dual_ccd;
             rodata.has_hybrid = topo.has_hybrid_cores;

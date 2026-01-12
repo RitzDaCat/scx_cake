@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use log::info;
-use scx_utils::{Topology, CoreType};
+use scx_utils::{CoreType, Topology};
 
 /// Maximum supported CPUs (matches BPF array sizes)
 pub const MAX_CPUS: usize = 64;
@@ -41,7 +41,7 @@ pub struct TopologyInfo {
     pub cpu_is_big: [u8; MAX_CPUS],
     pub llc_cpu_mask: [u64; MAX_LLCS],
     pub big_cpu_mask: u64,
-    
+
     // Info
     pub cpus_per_ccd: u32,
 }
@@ -49,19 +49,19 @@ pub struct TopologyInfo {
 pub fn detect() -> Result<TopologyInfo> {
     // robustly detect topology using scx_utils
     let topo = Topology::new()?;
-    
+
     let nr_cpus = topo.all_cpus.len();
     let nr_llcs = topo.all_llcs.len();
-    
+
     // Get sibling map directly from scx_utils
     let siblings = topo.sibling_cpus();
     let mut cpu_sibling_map = [0u8; MAX_CPUS];
-    
+
     // Default to self-mapping
     for i in 0..MAX_CPUS {
         cpu_sibling_map[i] = i as u8;
     }
-    
+
     // Populate with detected siblings
     for (cpu, &sibling) in siblings.iter().enumerate() {
         if cpu < MAX_CPUS && sibling >= 0 {
@@ -89,17 +89,17 @@ pub fn detect() -> Result<TopologyInfo> {
     // Note: topo.all_llcs keys are arbitrary kernel IDs. We must map them to 0..MAX_LLCS-1.
     // We'll just use a simple counter 0,1,2... as we iterate.
     let mut llc_idx = 0;
-    
+
     for (_, llc) in &topo.all_llcs {
         if llc_idx >= MAX_LLCS {
-            break; // Exceeded BPF limit, remaining CPUs effectively in LLC 0 or ignored? 
-                   // Ideally they map to 0 to be safe (fallback). 
+            break; // Exceeded BPF limit, remaining CPUs effectively in LLC 0 or ignored?
+                   // Ideally they map to 0 to be safe (fallback).
                    // But let's just stop mapping.
         }
-        
+
         let mut mask = 0u64;
         let mut core_count = 0;
-        
+
         for cpu_id in llc.all_cpus.keys() {
             let cpu = *cpu_id;
             if cpu < MAX_CPUS {
@@ -108,10 +108,12 @@ pub fn detect() -> Result<TopologyInfo> {
                 core_count += 1;
             }
         }
-        
+
         info.llc_cpu_mask[llc_idx] = mask;
-        if info.cpus_per_ccd == 0 { info.cpus_per_ccd = core_count; } // Estimate
-        
+        if info.cpus_per_ccd == 0 {
+            info.cpus_per_ccd = core_count;
+        } // Estimate
+
         llc_idx += 1;
     }
 
@@ -119,19 +121,19 @@ pub fn detect() -> Result<TopologyInfo> {
     // Reset defaults to recalculate based on CoreType
     info.cpu_is_big = [0; MAX_CPUS];
     info.big_cpu_mask = 0;
-    
+
     let mut p_cores_found = 0;
     let mut e_cores_found = 0;
 
     for core in topo.all_cores.values() {
-        // Determine is_big. 
-        // If CoreType::Efficiency -> 0. 
+        // Determine is_big.
+        // If CoreType::Efficiency -> 0.
         // If Performance or Unknown -> 1.
         let is_big = match core.core_type {
             CoreType::Little => 0,
             _ => 1,
         };
-        
+
         if is_big == 1 {
             p_cores_found += 1;
         } else {

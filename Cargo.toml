@@ -19,19 +19,11 @@ ratatui = "0.29"
 crossterm = "0.28"
 arboard = "3.4"
 
-scx_utils = { git = "https://github.com/sched-ext/scx", branch = "main" }
+scx_utils = { git = "https://github.com/sched-ext/scx", version = "1.0.25" }
 
 [build-dependencies]
-scx_cargo = { git = "https://github.com/sched-ext/scx", branch = "main" }
+scx_cargo = { git = "https://github.com/sched-ext/scx", version = "1.0.25" }
 
 [[bin]]
 name = "scx_cake"
 path = "src/main.rs"
-
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true
-panic = "abort"
-opt-level = 3
-debug = false
