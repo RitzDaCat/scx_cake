@@ -722,8 +722,6 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
     u32 cpu_key = scx_bpf_task_cpu(p);
     struct cake_cpu_status *cpu_status = bpf_map_lookup_elem(&cpu_tier_map, &cpu_key);
     if (cpu_status && cpu_status->tier != tier) {
-        cpu_status->tier = tier;
-        
         /* 
          * OPTIMIZATION: Lazy Victim Mask Update (Logical Check + Relaxed)
          * 1. Only update if the *logical* victim state changes (Victim <-> Non-Victim).
@@ -744,6 +742,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
                 }
             }
         }
+        cpu_status->tier = tier;
     }
 
     /* WAIT BUDGET CHECK (CAKE AQM) */
