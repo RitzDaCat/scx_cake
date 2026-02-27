@@ -1,6 +1,6 @@
 [package]
 name = "scx_cake"
-version = "1.0.2"
+version = "1.0.3"
 authors = ["RitzDaCat"]
 edition = "2021"
 description = "A sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling"
@@ -10,7 +10,7 @@ license = "GPL-2.0-only"
 anyhow = "1.0.100"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4"
-libbpf-rs = "=0.26.0"
+libbpf-rs = "=0.26.1"
 libc = "0.2.180"
 log = "0.4"
 env_logger = "0.11"
@@ -19,11 +19,13 @@ crossterm = "0.29"
 arboard = "3.6"
 
 scx_utils = { git = "https://github.com/sched-ext/scx", branch = "main", version = "1.0.26" }
+scx_arena = { git = "https://github.com/sched-ext/scx", branch = "main", version = "0.1.4" }
 core_affinity = "0.8"
 quanta = "0.12"
 crossbeam-utils = "0.8"
 tachyonfx = "0.22.0"
 nix = { version = "0.30", features = ["signal", "poll"] }
+sysinfo = "0.35.2"
 
 [build-dependencies]
 scx_cargo = { git = "https://github.com/sched-ext/scx", branch = "main", version = "1.0.27" }
